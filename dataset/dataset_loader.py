@@ -7,7 +7,10 @@ from torchvision import datasets, transforms
 import pandas as pd
 import torch.nn.functional as F
 
-from utils.utils import reshape_tensor, reshape_array, get_df_max_min, normalize, log_transform
+try:
+    from utils.utils import reshape_tensor, reshape_array, get_df_max_min, normalize, log_transform
+except ImportError:
+    from .utils.utils import reshape_tensor, reshape_array, get_df_max_min, normalize, log_transform
 
 class SNDataset(Dataset):
   def __init__(self, l8_dir, csv_dir , l8_bands: list = None ,transform = None, return_point_id = False):
@@ -141,7 +144,7 @@ class SNDatasetClimate(Dataset):
 
 class myNormalize:
   """Normalize the image and the target value"""
-  def __init__(self, img_bands_min_max =[[(0,7),(0,1)], [(7,12),(-1,1)], [(12), (-4,2963)], [(13), (0, 90)]], oc_min = 0, oc_max = 200):
+  def __init__(self, img_bands_min_max =[[(0,7),(0,1)], [(7,12),(-1,1)], [(12), (-4,2963)], [(13), (0, 90)]], oc_min = 0, oc_max = 200, normalize_oc = True, clip_oc = True):
     """
       A class to normalize image and target value arrays.
       
@@ -152,6 +155,8 @@ class myNormalize:
              `[(from_band, to_band),(min_of_bands , max_of_bands)]`
       - `oc_min` (int or float): The minimum value of the target array. Default is 0.
       - `oc_max` (int or float): The maximum value of the target array. Default is 1000.
+      - `normalize_oc` (bool): Whether to normalize the OC value to [0,1]. Default is True.
+      - `clip_oc` (bool): Whether to clip the OC value to [0,1] after normalization. Default is True.
       
       Returns:
       - A tuple containing the normalized image and target value arrays.
@@ -159,6 +164,8 @@ class myNormalize:
     self.img_bands_min_max = img_bands_min_max
     self.oc_min = oc_min
     self.oc_max = oc_max
+    self.normalize_oc = normalize_oc
+    self.clip_oc = clip_oc
 
   def __call__(self,sample):
     """
@@ -191,16 +198,18 @@ class myNormalize:
         else: # if it is not a tuple or an int
           raise ValueError('The first element of the tuple must be a tuple or an int')
         
-    # Normalize the target value (0,1)
-    oc = normalize(oc, self.oc_min, self.oc_max)
+    # Normalize the target value (0,1) - only if normalize_oc is True
+    if self.normalize_oc:
+        oc = normalize(oc, self.oc_min, self.oc_max)
+        # Clip OC value only if clip_oc is True
+        if self.clip_oc:
+            oc = oc if oc < 1 else 1
+            oc = oc if oc > 0 else 0
+    # else: keep oc in raw scale (no normalization, no clipping)
 
-    # Cutting out of range Vlaues
+    # Cutting out of range Values for image bands
     img[img > 1] = 1
     img[img < 0] = 0
-
-    # Modify data based the normalization process (no need for log transformation)
-    oc = oc if oc < 1 else 1
-    oc = oc if oc > 0 else 0
 
     # # log transformation instead of normalization 
     # oc = log_transform(oc)

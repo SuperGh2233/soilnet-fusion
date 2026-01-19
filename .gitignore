@@ -1,6 +1,71 @@
-**/__pycache__/ 
-results_physics/*
-results_simclr/*
-results/*
-results_simclr_lucas/*
+# Python 缓存和编译文件
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 训练结果和模型文件
+results/
+results_physics/
+results_simclr/
+results_simclr_lucas/
+*.pth.tar
+*.pth
+*.pkl
+bestmodel/
+checkpoints/
+pre_model/
+
+# 数据文件（大型文件，不推送）
 *.tif
+*.h5
+*.hdf5
+*.npy
+*.npz
+dataset/l8_images/
+dataset/Climate/
+dataset/simclr/
+dataset/simclr_past/
+dataset/simclr_RaCA/
+dataset/l8_images_us/
+dataset/l8_images_simclr_RaCA/
+
+# 结果和分析文件
+*.csv
+*.json
+*.png
+*.jpg
+*.jpeg
+*.pdf
+geography_analysis/
+regional_analysis/
+regional_performance_results*.csv
+
+# IDE 配置文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# 其他不需要推送的文件
+Poster-IADF-GRSS-School/
+readme_imgs/
+plot_utils/figures/
+tools/
+ViT-CoMer/  # 第三方库，如果不需要可以排除
+
+# 但保留关键代码文件（使用 ! 来覆盖上面的规则）
+!dataset/dataset_loader*.py
+!dataset/*.py
+!plot_utils/*.py
+!plot_utils/__init__.py

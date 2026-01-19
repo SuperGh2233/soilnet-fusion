@@ -1,4 +1,4 @@
-name: base
+name: geemap
 channels:
   - conda-forge
   - defaults
@@ -165,7 +165,7 @@ dependencies:
   - jedi=0.18.2=pyhd8ed1ab_0
   - jinja2=3.1.2=pyhd8ed1ab_1
   - joblib=1.2.0=pyhd8ed1ab_0
-  - jpeg=9e=h8ffe710_2
+  - jpeg
   - json5=0.9.5=pyh9f0ad1d_0
   - jsonschema=4.17.3=pyhd8ed1ab_0
   - jupyter_core=5.2.0=py39hcbf5309_0
@@ -224,11 +224,11 @@ dependencies:
   - libsqlite=3.40.0=hcfcfb64_0
   - libssh2=1.10.0=h9a1e1f7_3
   - libthrift=0.18.0=h9ce19ad_0
-  - libtiff=4.5.0=hee24885_3
+  - libtiff
   - libutf8proc=2.8.0=h82a8f57_0
   - libwebp-base=1.2.4=h8ffe710_0
   - libxcb=1.13=hcd874cb_1004
-  - libxml2=2.10.3=hc3477c8_2
+  - libxml2
   - libxslt=1.1.37=h0192164_0
   - libzip=1.9.2=h519de47_1
   - libzlib=1.2.13=hcfcfb64_4
