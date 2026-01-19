@@ -131,6 +131,8 @@ def parse_arguments():
 						help='Weight for semantic alignment loss in total loss (default: 0.1)')
 	parser.add_argument('--scmrl_temperature', type=float, default=0.07,
 						help='Temperature parameter for semantic alignment loss (default: 0.07)')
+	parser.add_argument('--scmrl_parallel', action='store_true', default=False,
+						help='Use parallel fusion instead of sequential fusion for S-CMRL (default: False, sequential)')
 
 	args = parser.parse_args()
 	return args
@@ -251,6 +253,7 @@ if __name__ == '__main__':
 	SCMRL_ALPHA_INIT = args.scmrl_alpha_init
 	SCMRL_LAMBDA_ALIGN = args.scmrl_lambda_align
 	SCMRL_TEMPERATURE = args.scmrl_temperature
+	SCMRL_PARALLEL = args.scmrl_parallel
 	
 	if LABEL_MODE in ['baseline_raw_mse', 'log1p_mse', 'log1p_huber', 'log1p_huber_w']:
 		# 四组消融实验：标签保持原尺度，不归一化，不clip
@@ -734,6 +737,7 @@ if __name__ == '__main__':
 								use_scmrl_fusion=USE_SCMRL_FUSION,
 								scmrl_alpha_init=SCMRL_ALPHA_INIT,
 								scmrl_temperature=SCMRL_TEMPERATURE,
+								scmrl_parallel=SCMRL_PARALLEL,
 								# static_dim 会在模型内部根据SCMRL fusion自动设置，不需要手动传递
 							).to(device)
 							print(f"Using static features (numeric_dim={static_numeric_dim}, lulc_classes={lulc_classes}) in model.")
@@ -833,6 +837,7 @@ if __name__ == '__main__':
 							use_scmrl_fusion=USE_SCMRL_FUSION,
 							scmrl_alpha_init=SCMRL_ALPHA_INIT,
 							scmrl_temperature=SCMRL_TEMPERATURE,
+							scmrl_parallel=SCMRL_PARALLEL,
 							static_dim=static_dim
 						).to(device)
 				else:

@@ -13,7 +13,7 @@ from submodules.vit_hybrid import HybridViT
 from submodules.regressor import Regressor, MultiHeadRegressor
 from submodules.spectral_enhancement import SpectralEnhancer
 from submodules.spectral_cnn import MultiPreprocSpectralCNN  # 基于 Tziolas et al. (Geoderma, 2024)
-from submodules.semantic_aligned_fusion import SemanticAlignedFusion, SemanticAlignmentLoss  # S-CMRL 融合
+from submodules.semantic_aligned_fusion import SemanticAlignedFusion, SemanticAlignedFusionParallel, SemanticAlignmentLoss  # S-CMRL 融合
 from typing import Tuple, Optional
 from submodules.src.transformer.transformer import TSTransformerEncoderClassiregressor
 from submodules import rnn
@@ -335,6 +335,7 @@ class SoilNetLSTM(nn.Module):
                  use_scmrl_fusion: bool = False,
                  scmrl_alpha_init: float = 1.5,
                  scmrl_temperature: float = 0.07,
+                 scmrl_parallel: bool = False,  # 是否使用并行融合（默认False为串行）
                  static_dim: Optional[int] = None):
         
         super().__init__()
@@ -349,6 +350,7 @@ class SoilNetLSTM(nn.Module):
         
         # S-CMRL 融合选项
         self.use_scmrl_fusion = bool(use_scmrl_fusion)
+        self.scmrl_parallel = bool(scmrl_parallel) if use_scmrl_fusion else False
         
         # ========== 图像编码器选择 ==========
         # 基于 Tziolas et al. (Geoderma, 2024) 的多预处理光谱 CNN
@@ -442,19 +444,32 @@ class SoilNetLSTM(nn.Module):
 
         # S-CMRL 融合模块（如果启用）
         if self.use_scmrl_fusion:
+            fusion_type = "Parallel" if self.scmrl_parallel else "Sequential"
             print(f"[Info] Using S-CMRL Fusion (Semantic-Alignment Cross-Modal Residual Learning)")
+            print(f"       Mode: {fusion_type} fusion")
             print(f"       alpha_init={scmrl_alpha_init}, temperature={scmrl_temperature}")
             
-            # 创建融合模块
-            self.fusion = SemanticAlignedFusion(
-                climate_dim=lstm_out,
-                visual_dim=regresor_input_from_cnn,
-                static_dim=static_dim,
-                num_heads=8,
-                alpha_init=scmrl_alpha_init,
-                learnable_alpha=True,
-                dropout=0.1
-            )
+            # 创建融合模块（串行或并行）
+            if self.scmrl_parallel:
+                self.fusion = SemanticAlignedFusionParallel(
+                    climate_dim=lstm_out,
+                    visual_dim=regresor_input_from_cnn,
+                    static_dim=static_dim,
+                    num_heads=8,
+                    alpha_init=scmrl_alpha_init,
+                    learnable_alpha=True,
+                    dropout=0.1
+                )
+            else:
+                self.fusion = SemanticAlignedFusion(
+                    climate_dim=lstm_out,
+                    visual_dim=regresor_input_from_cnn,
+                    static_dim=static_dim,
+                    num_heads=8,
+                    alpha_init=scmrl_alpha_init,
+                    learnable_alpha=True,
+                    dropout=0.1
+                )
             
             # 语义对齐损失（用于训练）
             self.alignment_loss_fn = SemanticAlignmentLoss(temperature=scmrl_temperature)

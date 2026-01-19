@@ -298,6 +298,149 @@ class SemanticAlignedFusion(nn.Module):
         return alphas
 
 
+class SemanticAlignedFusionParallel(nn.Module):
+    """
+    并行版本的语义对齐跨模态残差融合模块
+    
+    改进点：从串行融合改为并行融合
+    - 串行：Climate + Visual → Result1, Result1 + Static → Final
+    - 并行：Climate 分别查询 Visual 和 Static，然后将残差相加
+    
+    优点：
+    1. Visual 和 Static 互不干扰，梯度传播更直接
+    2. 物理意义更清晰：Climate 同时受到 Visual（当前地表）和 Static（固有环境）的修正
+    3. 两个弱模态的贡献独立学习，可能更灵活
+    
+    公式：
+    fused_feat = climate_feat + alpha_v * Attention(Q=climate, K=visual, V=visual) 
+                              + alpha_s * Attention(Q=climate, K=static, V=static)
+    """
+    
+    def __init__(
+        self,
+        climate_dim: int,
+        visual_dim: int,
+        static_dim: Optional[int] = None,
+        num_heads: int = 8,
+        alpha_init: float = 1.5,
+        learnable_alpha: bool = True,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        
+        self.climate_dim = climate_dim
+        self.visual_dim = visual_dim
+        self.static_dim = static_dim
+        
+        # Climate + Visual 融合（独立）
+        self.climate_visual_fusion = CrossModalResidualBlock(
+            climate_dim=climate_dim,
+            weak_dim=visual_dim,
+            num_heads=num_heads,
+            alpha_init=alpha_init,
+            learnable_alpha=learnable_alpha,
+            dropout=dropout
+        )
+        
+        # Climate + Static 融合（独立，并行）
+        if static_dim is not None:
+            self.climate_static_fusion = CrossModalResidualBlock(
+                climate_dim=climate_dim,
+                weak_dim=static_dim,
+                num_heads=num_heads,
+                alpha_init=alpha_init,
+                learnable_alpha=learnable_alpha,
+                dropout=dropout
+            )
+        else:
+            self.climate_static_fusion = None
+        
+        # 最终的 LayerNorm（可选，用于稳定训练）
+        self.final_norm = nn.LayerNorm(climate_dim)
+    
+    def forward(
+        self,
+        climate_feat: torch.Tensor,
+        visual_feat: torch.Tensor,
+        static_feat: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        并行融合前向传播
+        
+        Args:
+            climate_feat: Climate 特征 [B, climate_dim] 或 [B, seq_len, climate_dim]
+            visual_feat: Visual 特征 [B, visual_dim] 或 [B, seq_len, visual_dim]
+            static_feat: Static 特征 [B, static_dim]（可选）
+        
+        Returns:
+            fused_feat: 融合后的特征，形状与 climate_feat 相同
+        """
+        # 处理维度：如果输入是 2D，添加序列维度
+        if climate_feat.dim() == 2:
+            climate_feat = climate_feat.unsqueeze(1)  # [B, 1, climate_dim]
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        if visual_feat.dim() == 2:
+            visual_feat = visual_feat.unsqueeze(1)
+        
+        if static_feat is not None and static_feat.dim() == 2:
+            static_feat = static_feat.unsqueeze(1)
+        
+        # Step 1: 分别计算残差（并行）
+        # Climate 查询 Visual - 只计算残差部分（不包含原始climate_feat）
+        visual_proj = self.climate_visual_fusion.weak_proj(visual_feat)
+        visual_attn_out, _ = self.climate_visual_fusion.cross_attention(
+            query=climate_feat,
+            key=visual_proj,
+            value=visual_proj
+        )
+        resid_visual = self.climate_visual_fusion.alpha * self.climate_visual_fusion.dropout(visual_attn_out)
+        
+        # Climate 查询 Static（如果提供）- 只计算残差部分
+        resid_static = None
+        if static_feat is not None and self.climate_static_fusion is not None:
+            static_proj = self.climate_static_fusion.weak_proj(static_feat)
+            static_attn_out, _ = self.climate_static_fusion.cross_attention(
+                query=climate_feat,
+                key=static_proj,
+                value=static_proj
+            )
+            resid_static = self.climate_static_fusion.alpha * self.climate_static_fusion.dropout(static_attn_out)
+        
+        # Step 2: 统一相加（并行融合）
+        # 公式：fused_feat = climate_feat + resid_visual + resid_static
+        fused_feat = climate_feat + resid_visual
+        if resid_static is not None:
+            fused_feat = fused_feat + resid_static
+        
+        # 最终归一化
+        fused_feat = self.final_norm(fused_feat)
+        
+        # 如果输入是 2D，移除序列维度
+        if squeeze_output:
+            fused_feat = fused_feat.squeeze(1)  # [B, climate_dim]
+        
+        return fused_feat
+    
+    def get_alpha_values(self) -> dict:
+        """
+        获取 alpha 参数值（用于监控弱模态的贡献）
+        
+        Returns:
+            dict: 包含各个融合块的 alpha 值
+        """
+        alphas = {
+            'climate_visual': self.climate_visual_fusion.alpha.item()
+        }
+        
+        if self.climate_static_fusion is not None:
+            alphas['climate_static'] = self.climate_static_fusion.alpha.item()
+        
+        return alphas
+
+
 # ========== 测试代码 ==========
 if __name__ == '__main__':
     print("=" * 70)
