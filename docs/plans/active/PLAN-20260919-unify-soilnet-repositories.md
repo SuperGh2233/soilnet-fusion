@@ -123,9 +123,12 @@ and model-service code separately.
   console encoding error in its failure message; it was not changed.
 - `git diff --check` passed for all files touched by this plan; unrelated
   pre-existing blank-at-EOF warnings remain in other local files.
+- Local `main` and `origin/main` matched after publication at
+  `27df66d3597224af4e1b23221d1f12de9cb63e43`; the original GitHub remote is
+  retained as `upstream-original` and the Gitee remote is retained as `gitee`.
 
 ## Status and next action
 
-Status: ready for publication. Next action: commit the staged source/docs
-changes, switch `origin` to `SuperGh2233/soilnet-fusion`, push `main`, and then
-record the resulting commit here.
+Status: completed. The fusion source is published at
+`SuperGh2233/soilnet-fusion@27df66d3597224af4e1b23221d1f12de9cb63e43`; the
+system application remains in `SuperGh2233/soilnet-sys`.
