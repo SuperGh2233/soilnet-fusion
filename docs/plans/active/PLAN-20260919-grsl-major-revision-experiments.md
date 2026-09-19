@@ -181,9 +181,23 @@ letter and revised manuscript.
 - Preliminary reanalysis of the submitted predictions produced original-value
   and upper-tail metrics plus paired-bootstrap evidence in
   `docs/evals/EVAL-20260919-submitted-split-reanalysis.md`.
+- The corrected repository revision `c399d97` was deployed to an NVIDIA A100
+  40 GB server. The transferred experiment subset was verified as 3,451 image
+  files and 694 climate files; both the transfer archive and split manifest
+  matched their local SHA-256 hashes.
+- An A100 one-epoch SAP-RF smoke run completed validation-only checkpoint
+  selection and wrote predictions, metadata, and `run_summary.json`.
+- The resumable 25-job core queue started on 2026-09-19 at approximately 22:25
+  CST. At 22:49 it was on concat seed 1, epoch 45/60, with no error logs.
+- A separate guarded follow-up process now waits for exactly 25 verified core
+  markers, runs the seven sensitivity jobs, requires 32 total markers, and
+  then runs the 10,000-sample aggregate/bootstrap analysis.
 
 ## Status and next action
 
-Status: active. The corrected protocol and smoke checks are implemented. Next
-action: launch the five-configuration, five-seed core GPU queue, then aggregate
-the corrected results before running sensitivity jobs.
+Status: active. The corrected protocol is deployed and the five-configuration,
+five-seed core A100 queue is running. The next executable action is to monitor
+the completion markers and error logs; the guarded follow-up process will run
+the sensitivity matrix and aggregate analysis automatically after the core
+queue succeeds. The 2014-vs-2015 temporal experiment remains unavailable until
+matched 2014 imagery is acquired.

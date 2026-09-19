@@ -20,7 +20,7 @@
 
 ## Operations and recovery
 
-- `docs/agent-handoff.md` (created only when work pauses across sessions): transient recovery state.
+- `docs/agent-handoff.md` (active): transient A100 queue state, recovery checks, and the next executable action.
 
 ## Document discipline
 
