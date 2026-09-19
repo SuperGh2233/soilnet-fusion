@@ -31,8 +31,10 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
         # 如果使用SCMRL fusion，需要传入编码后的静态特征维度（与hidden_size相同）
         # 因为StaticBranch会将静态特征编码为hidden_size维度
         use_scmrl = kwargs.get('use_scmrl_fusion', False)
+        use_film = kwargs.get('use_film_fusion', False)
         hidden_size = kwargs.get('hidden_size', 128)
-        if use_scmrl and static_feature_dim > 0:
+        static_hidden_dim = kwargs.get('lstm_out', hidden_size) if kwargs.get('scmrl_checkpoint_compatible', False) else hidden_size
+        if (use_scmrl or use_film) and static_feature_dim > 0:
             # 编码后的静态特征维度 = hidden_size（StaticBranch的输出维度）
             kwargs['static_dim'] = hidden_size
         
@@ -57,7 +59,7 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
                     numeric_dim=static_in_dim,
                     lulc_classes=self.lulc_num_classes,
                     lulc_embed_dim=self.lulc_embed_dim,
-                    hidden=hidden_size,
+                    hidden=static_hidden_dim,
                     dropout=0.3,
                 )
                 # 若需要在外部检查嵌入可用性，提供同名属性
@@ -68,7 +70,7 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
             # 检查是否使用SCMRL fusion（父类已经初始化了use_scmrl_fusion属性）
             use_scmrl = getattr(self, 'use_scmrl_fusion', False)
             
-            if use_scmrl:
+            if use_scmrl or getattr(self, 'use_film_fusion', False):
                 # 如果使用SCMRL fusion，回归器接收融合后的单一特征向量（维度为lstm_out）
                 reg_input_dim = lstm_dim
                 if self.use_regional_adaptation and getattr(self, "region_embedding", None) is not None:
@@ -127,18 +129,18 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
         # CNN特征提取
         if self.use_spectral_enhance:
             raster_stack = self.spectral(raster_stack)
-        cnn_features = self.cnn(raster_stack)  # [B, cnn_dim]
+        cnn_features, visual_fusion_features = self._extract_visual_features(raster_stack)
         
         # 气候特征提取
         climate_features = self.lstm(ts_features)  # [B, lstm_dim]
         
         # 保存中间特征（用于对齐损失计算，如果使用SCMRL）
-        if hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion:
+        if (hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion) or getattr(self, 'use_film_fusion', False):
             self._last_climate_feat = climate_features
-            self._last_visual_feat = cnn_features
+            self._last_visual_feat = visual_fusion_features
         
         # S-CMRL 融合或原有融合方式
-        if hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion:
+        if (hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion) or getattr(self, 'use_film_fusion', False):
             # 使用 S-CMRL 融合（静态特征会参与融合）
             # 先使用StaticBranch编码静态特征
             static_encoded = None
@@ -181,7 +183,7 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
                         print(f"  - static_feature_dim: {self.static_feature_dim}")
                         print(f"  - static_branch is None: {self.static_branch is None}")
             
-            fused_feat = self.fusion(climate_features, cnn_features, static_encoded)
+            fused_feat = self.fusion(climate_features, visual_fusion_features, static_encoded)
             
             # 如果有区域自适应，需要额外处理
             if self.use_regional_adaptation and getattr(self, "region_embedding", None) is not None and region_ids is not None:
@@ -211,4 +213,3 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
             output = self.reg(*reg_inputs)
         
         return output
-

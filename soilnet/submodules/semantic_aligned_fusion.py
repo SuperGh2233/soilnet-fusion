@@ -31,7 +31,7 @@ class CrossModalResidualBlock(nn.Module):
     其中：
     - Q (Query): 来自 Climate 分支（强模态）
     - K, V (Key, Value): 来自 Visual/Static 分支（弱模态）
-    - alpha: 可学习参数，初始化为 1.5（参考 S-CMRL 仓库）
+    - alpha: learnable residual scale controlling the auxiliary contribution
     
     这样设计的好处：
     1. Climate 作为 Query，主动"检索"弱模态中有用的信息
@@ -77,7 +77,25 @@ class CrossModalResidualBlock(nn.Module):
         if learnable_alpha:
             self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
         else:
-            self.register_buffer('alpha', torch.tensor(alpha_init, dtype=torch.float32))
+            self.register_buffer("alpha", torch.tensor(alpha_init, dtype=torch.float32))
+
+    def gate_value(self) -> torch.Tensor:
+        return self.alpha
+
+    def attention_residual(
+        self,
+        climate_feat: torch.Tensor,
+        weak_feat: torch.Tensor
+    ) -> torch.Tensor:
+        if weak_feat.dim() == 2:
+            weak_feat = weak_feat.unsqueeze(1)
+        key_value = self.weak_proj(weak_feat)
+        attn_out, _ = self.cross_attention(
+            query=climate_feat,
+            key=key_value,
+            value=key_value
+        )
+        return self.alpha * self.dropout(attn_out)
     
     def forward(
         self,
@@ -101,21 +119,13 @@ class CrossModalResidualBlock(nn.Module):
         
         if weak_feat.dim() == 2:
             weak_feat = weak_feat.unsqueeze(1)  # [B, 1, weak_dim]
-        
         # 投影弱模态特征到 Climate 维度
-        weak_proj = self.weak_proj(weak_feat)  # [B, seq_len, climate_dim]
         
         # 跨模态注意力：Climate 作为 Query，弱模态作为 Key/Value
-        # Query: climate_feat, Key: weak_proj, Value: weak_proj
-        attn_out, _ = self.cross_attention(
-            query=climate_feat,
-            key=weak_proj,
-            value=weak_proj
-        )
         
         # 残差连接：F_final = F_climate + alpha * Attention(...)
         # 这样设计保证强模态的主导地位
-        fused_feat = climate_feat + self.alpha * self.dropout(attn_out)
+        fused_feat = climate_feat + self.attention_residual(climate_feat, weak_feat)
         fused_feat = self.norm(fused_feat)
         
         # 如果输入是 2D，移除序列维度
@@ -123,6 +133,221 @@ class CrossModalResidualBlock(nn.Module):
             fused_feat = fused_feat.squeeze(1)  # [B, climate_dim]
         
         return fused_feat
+
+
+class ResidualProjectionBlock(nn.Module):
+    """Inject a vector-valued auxiliary modality through a scaled residual."""
+
+    def __init__(
+        self,
+        base_dim: int,
+        auxiliary_dim: int,
+        alpha_init: float = 1.5,
+        learnable_alpha: bool = True,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.weak_proj = nn.Linear(auxiliary_dim, base_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(base_dim)
+        if learnable_alpha:
+            self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        else:
+            self.register_buffer("alpha", torch.tensor(alpha_init, dtype=torch.float32))
+
+    def gate_value(self) -> torch.Tensor:
+        return self.alpha
+
+    def residual(self, auxiliary_feat: torch.Tensor) -> torch.Tensor:
+        if auxiliary_feat.dim() == 3:
+            auxiliary_feat = auxiliary_feat.mean(dim=1)
+        return self.alpha * self.dropout(self.weak_proj(auxiliary_feat))
+
+    def forward(
+        self,
+        base_feat: torch.Tensor,
+        auxiliary_feat: torch.Tensor
+    ) -> torch.Tensor:
+        residual = self.residual(auxiliary_feat)
+        if base_feat.dim() == 3:
+            residual = residual.unsqueeze(1)
+        return self.norm(base_feat + residual)
+
+
+class LegacyCrossModalResidualBlock(nn.Module):
+    """Original vector-input residual attention used by the 0.5404 run."""
+
+    def __init__(self, climate_dim, weak_dim, num_heads=8, alpha_init=1.5,
+                 learnable_alpha=True, dropout=0.1):
+        super().__init__()
+        self.weak_proj = nn.Linear(weak_dim, climate_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=climate_dim, num_heads=num_heads, kdim=climate_dim,
+            vdim=climate_dim, dropout=dropout, batch_first=True
+        )
+        self.norm = nn.LayerNorm(climate_dim)
+        self.dropout = nn.Dropout(dropout)
+        if learnable_alpha:
+            self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        else:
+            self.register_buffer("alpha", torch.tensor(alpha_init, dtype=torch.float32))
+
+    def residual(self, climate_feat, weak_feat):
+        if weak_feat.dim() == 2:
+            weak_feat = weak_feat.unsqueeze(1)
+        weak_proj = self.weak_proj(weak_feat)
+        attn_out, _ = self.cross_attention(
+            query=climate_feat, key=weak_proj, value=weak_proj
+        )
+        return self.alpha * self.dropout(attn_out)
+
+    def forward(self, climate_feat, weak_feat):
+        squeeze_output = climate_feat.dim() == 2
+        if squeeze_output:
+            climate_feat = climate_feat.unsqueeze(1)
+        fused = self.norm(climate_feat + self.residual(climate_feat, weak_feat))
+        return fused.squeeze(1) if squeeze_output else fused
+
+
+class LegacySemanticAlignedFusion(nn.Module):
+    """Sequential vector-input residual fusion retained for comparison."""
+
+    def __init__(self, climate_dim, visual_dim, static_dim=None, num_heads=8,
+                 alpha_init=1.5, learnable_alpha=True, dropout=0.1):
+        super().__init__()
+        self.climate_visual_fusion = LegacyCrossModalResidualBlock(
+            climate_dim, visual_dim, num_heads, alpha_init, learnable_alpha, dropout
+        )
+        self.climate_static_fusion = (
+            LegacyCrossModalResidualBlock(
+                climate_dim, static_dim, num_heads, alpha_init, learnable_alpha, dropout
+            ) if static_dim is not None else None
+        )
+
+    def forward(self, climate_feat, visual_feat, static_feat=None):
+        fused = self.climate_visual_fusion(climate_feat, visual_feat)
+        if static_feat is not None and self.climate_static_fusion is not None:
+            fused = self.climate_static_fusion(fused, static_feat)
+        return fused
+
+    def get_alpha_values(self):
+        alphas = {"climate_visual": self.climate_visual_fusion.alpha.item()}
+        if self.climate_static_fusion is not None:
+            alphas["climate_static"] = self.climate_static_fusion.alpha.item()
+        return alphas
+
+
+class LegacySemanticAlignedFusionParallel(nn.Module):
+    """Original parallel vector-input residual fusion used by the 0.5404 run."""
+
+    def __init__(self, climate_dim, visual_dim, static_dim=None, num_heads=8,
+                 alpha_init=1.5, learnable_alpha=True, dropout=0.1):
+        super().__init__()
+        self.climate_visual_fusion = LegacyCrossModalResidualBlock(
+            climate_dim, visual_dim, num_heads, alpha_init, learnable_alpha, dropout
+        )
+        self.climate_static_fusion = (
+            LegacyCrossModalResidualBlock(
+                climate_dim, static_dim, num_heads, alpha_init, learnable_alpha, dropout
+            ) if static_dim is not None else None
+        )
+        self.final_norm = nn.LayerNorm(climate_dim)
+
+    def forward(self, climate_feat, visual_feat, static_feat=None):
+        squeeze_output = climate_feat.dim() == 2
+        if squeeze_output:
+            climate_feat = climate_feat.unsqueeze(1)
+        fused = climate_feat + self.climate_visual_fusion.residual(
+            climate_feat, visual_feat
+        )
+        if static_feat is not None and self.climate_static_fusion is not None:
+            fused = fused + self.climate_static_fusion.residual(
+                climate_feat, static_feat
+            )
+        fused = self.final_norm(fused)
+        return fused.squeeze(1) if squeeze_output else fused
+
+    def get_alpha_values(self):
+        alphas = {"climate_visual": self.climate_visual_fusion.alpha.item()}
+        if self.climate_static_fusion is not None:
+            alphas["climate_static"] = self.climate_static_fusion.alpha.item()
+        return alphas
+
+
+class CheckpointGatedCrossAttention(nn.Module):
+    """Gated cross-attention block used by the released SoilNet-Fusion checkpoint."""
+
+    def __init__(self, climate_dim, weak_dim, num_heads=8, alpha_init=1.5, dropout=0.1):
+        super().__init__()
+        if climate_dim % num_heads != 0:
+            raise ValueError("climate_dim must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.head_dim = climate_dim // num_heads
+        self.weak_proj = nn.Linear(weak_dim, climate_dim)
+        self.cross_attention = nn.Module()
+        self.cross_attention.q_proj = nn.Linear(climate_dim, climate_dim)
+        self.cross_attention.k_proj = nn.Linear(climate_dim, climate_dim)
+        self.cross_attention.v_proj = nn.Linear(climate_dim, climate_dim)
+        self.cross_attention.o_proj = nn.Linear(climate_dim, climate_dim)
+        self.cross_attention.gate_net = nn.Module()
+        self.cross_attention.gate_net.gate_net = nn.Sequential(
+            nn.Linear(climate_dim * 2, climate_dim // 4, bias=False),
+            nn.ReLU(),
+            nn.Linear(climate_dim // 4, climate_dim, bias=False),
+        )
+        self.norm = nn.LayerNorm(climate_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+
+    def forward(self, climate_feat, weak_feat):
+        squeeze_output = climate_feat.dim() == 2
+        if squeeze_output:
+            climate_feat = climate_feat.unsqueeze(1)
+        if weak_feat.dim() == 2:
+            weak_feat = weak_feat.unsqueeze(1)
+
+        weak_feat = self.weak_proj(weak_feat)
+        batch_size, query_len, dim = climate_feat.shape
+        key_len = weak_feat.size(1)
+        query = self.cross_attention.q_proj(climate_feat).view(
+            batch_size, query_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key = self.cross_attention.k_proj(weak_feat).view(
+            batch_size, key_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        value = self.cross_attention.v_proj(weak_feat).view(
+            batch_size, key_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        attention = torch.softmax(torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim ** 0.5), dim=-1)
+        context = torch.matmul(attention, value).transpose(1, 2).contiguous().view(batch_size, query_len, dim)
+        context = self.cross_attention.o_proj(context)
+        gate = torch.sigmoid(self.cross_attention.gate_net.gate_net(torch.cat([climate_feat, context], dim=-1)))
+        fused = self.norm(climate_feat + self.alpha * self.dropout(gate * context))
+        return fused.squeeze(1) if squeeze_output else fused
+
+
+class CheckpointCompatibleFusion(nn.Module):
+    """Parallel climate-dominant fusion with the parameter layout of the saved model."""
+
+    def __init__(self, climate_dim, visual_dim, static_dim=None, num_heads=8, alpha_init=1.5, dropout=0.1):
+        super().__init__()
+        self.fusion_weight_visual = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.fusion_weight_static = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.climate_visual_fusion = CheckpointGatedCrossAttention(
+            climate_dim, visual_dim, num_heads, alpha_init, dropout
+        )
+        self.climate_static_fusion = (
+            CheckpointGatedCrossAttention(climate_dim, static_dim, num_heads, alpha_init, dropout)
+            if static_dim is not None else None
+        )
+
+    def forward(self, climate_feat, visual_feat, static_feat=None):
+        visual_fused = self.climate_visual_fusion(climate_feat, visual_feat)
+        fused = climate_feat + self.fusion_weight_visual * (visual_fused - climate_feat)
+        if static_feat is not None and self.climate_static_fusion is not None:
+            static_fused = self.climate_static_fusion(climate_feat, static_feat)
+            fused = fused + self.fusion_weight_static * (static_fused - climate_feat)
+        return fused
 
 
 class SemanticAlignmentLoss(nn.Module):
@@ -212,7 +437,7 @@ class SemanticAlignedFusion(nn.Module):
     
     融合策略：
     1. 先融合 Climate + Visual（通过 CrossModalResidualBlock）
-    2. 再融合结果 + Static（通过另一个 CrossModalResidualBlock）
+    2. 再通过受控残差投影注入 Static 向量
     3. 最终输出与 Climate 维度相同
     """
     
@@ -242,12 +467,11 @@ class SemanticAlignedFusion(nn.Module):
             dropout=dropout
         )
         
-        # Climate-Visual 融合结果 + Static 融合
+        # Static 是单向量，因此使用残差投影而不是退化的 cross-attention
         if static_dim is not None:
-            self.climate_static_fusion = CrossModalResidualBlock(
-                climate_dim=climate_dim,
-                weak_dim=static_dim,
-                num_heads=num_heads,
+            self.climate_static_fusion = ResidualProjectionBlock(
+                base_dim=climate_dim,
+                auxiliary_dim=static_dim,
                 alpha_init=alpha_init,
                 learnable_alpha=learnable_alpha,
                 dropout=dropout
@@ -289,11 +513,11 @@ class SemanticAlignedFusion(nn.Module):
             dict: 包含各个融合块的 alpha 值
         """
         alphas = {
-            'climate_visual': self.climate_visual_fusion.alpha.item()
+            'climate_visual': self.climate_visual_fusion.gate_value().item()
         }
         
         if self.climate_static_fusion is not None:
-            alphas['climate_static'] = self.climate_static_fusion.alpha.item()
+            alphas['climate_static'] = self.climate_static_fusion.gate_value().item()
         
         return alphas
 
@@ -304,7 +528,7 @@ class SemanticAlignedFusionParallel(nn.Module):
     
     改进点：从串行融合改为并行融合
     - 串行：Climate + Visual → Result1, Result1 + Static → Final
-    - 并行：Climate 分别查询 Visual 和 Static，然后将残差相加
+    - 并行：Climate 查询 Visual tokens，并与 Static 残差投影相加
     
     优点：
     1. Visual 和 Static 互不干扰，梯度传播更直接
@@ -312,8 +536,8 @@ class SemanticAlignedFusionParallel(nn.Module):
     3. 两个弱模态的贡献独立学习，可能更灵活
     
     公式：
-    fused_feat = climate_feat + alpha_v * Attention(Q=climate, K=visual, V=visual) 
-                              + alpha_s * Attention(Q=climate, K=static, V=static)
+    fused_feat = climate_feat + alpha_v * Attention(Q=climate, K=visual, V=visual)
+                              + alpha_s * Projection(static)
     """
     
     def __init__(
@@ -342,12 +566,11 @@ class SemanticAlignedFusionParallel(nn.Module):
             dropout=dropout
         )
         
-        # Climate + Static 融合（独立，并行）
+        # Static 是单向量，因此使用独立残差投影
         if static_dim is not None:
-            self.climate_static_fusion = CrossModalResidualBlock(
-                climate_dim=climate_dim,
-                weak_dim=static_dim,
-                num_heads=num_heads,
+            self.climate_static_fusion = ResidualProjectionBlock(
+                base_dim=climate_dim,
+                auxiliary_dim=static_dim,
                 alpha_init=alpha_init,
                 learnable_alpha=learnable_alpha,
                 dropout=dropout
@@ -369,7 +592,7 @@ class SemanticAlignedFusionParallel(nn.Module):
         
         Args:
             climate_feat: Climate 特征 [B, climate_dim] 或 [B, seq_len, climate_dim]
-            visual_feat: Visual 特征 [B, visual_dim] 或 [B, seq_len, visual_dim]
+            visual_feat: Visual 空间 tokens [B, num_tokens, visual_dim]
             static_feat: Static 特征 [B, static_dim]（可选）
         
         Returns:
@@ -384,30 +607,20 @@ class SemanticAlignedFusionParallel(nn.Module):
         
         if visual_feat.dim() == 2:
             visual_feat = visual_feat.unsqueeze(1)
-        
         if static_feat is not None and static_feat.dim() == 2:
             static_feat = static_feat.unsqueeze(1)
         
         # Step 1: 分别计算残差（并行）
         # Climate 查询 Visual - 只计算残差部分（不包含原始climate_feat）
-        visual_proj = self.climate_visual_fusion.weak_proj(visual_feat)
-        visual_attn_out, _ = self.climate_visual_fusion.cross_attention(
-            query=climate_feat,
-            key=visual_proj,
-            value=visual_proj
+        resid_visual = self.climate_visual_fusion.attention_residual(
+            climate_feat,
+            visual_feat
         )
-        resid_visual = self.climate_visual_fusion.alpha * self.climate_visual_fusion.dropout(visual_attn_out)
         
-        # Climate 查询 Static（如果提供）- 只计算残差部分
+        # Static 是单向量，通过投影计算残差
         resid_static = None
         if static_feat is not None and self.climate_static_fusion is not None:
-            static_proj = self.climate_static_fusion.weak_proj(static_feat)
-            static_attn_out, _ = self.climate_static_fusion.cross_attention(
-                query=climate_feat,
-                key=static_proj,
-                value=static_proj
-            )
-            resid_static = self.climate_static_fusion.alpha * self.climate_static_fusion.dropout(static_attn_out)
+            resid_static = self.climate_static_fusion.residual(static_feat).unsqueeze(1)
         
         # Step 2: 统一相加（并行融合）
         # 公式：fused_feat = climate_feat + resid_visual + resid_static
@@ -432,12 +645,116 @@ class SemanticAlignedFusionParallel(nn.Module):
             dict: 包含各个融合块的 alpha 值
         """
         alphas = {
-            'climate_visual': self.climate_visual_fusion.alpha.item()
+            'climate_visual': self.climate_visual_fusion.gate_value().item()
         }
         
         if self.climate_static_fusion is not None:
-            alphas['climate_static'] = self.climate_static_fusion.alpha.item()
+            alphas['climate_static'] = self.climate_static_fusion.gate_value().item()
         
+        return alphas
+
+
+class FiLMFusion(nn.Module):
+    """
+    FiLM (Feature-wise Linear Modulation) 融合模块
+
+    用弱模态生成 scale 和 shift 来调制强模态（Climate）：
+        fused = climate * (1 + alpha * scale) + alpha * shift
+
+    优点：
+    - 计算高效，不依赖序列长度
+    - 梯度流好，alpha 可以有效学习
+    - 适合 2D 特征输入（来自 CNN/RNN 的 flat 输出）
+
+    参考: Perez et al., "FiLM: Visual Reasoning with a General Conditioning Layer", AAAI 2018
+    """
+
+    def __init__(
+        self,
+        climate_dim: int,
+        visual_dim: int,
+        static_dim: Optional[int] = None,
+        alpha_init: float = 1.5,
+        learnable_alpha: bool = True,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+
+        self.climate_dim = climate_dim
+        self.visual_dim = visual_dim
+        self.static_dim = static_dim
+
+        # Visual -> scale 和 shift
+        self.visual_scale = nn.Sequential(
+            nn.Linear(visual_dim, climate_dim),
+            nn.Tanh()  # 限制 scale 范围在 [-1, 1]
+        )
+        self.visual_shift = nn.Linear(visual_dim, climate_dim)
+
+        # Static -> scale 和 shift (如果提供)
+        if static_dim is not None:
+            self.static_scale = nn.Sequential(
+                nn.Linear(static_dim, climate_dim),
+                nn.Tanh()
+            )
+            self.static_shift = nn.Linear(static_dim, climate_dim)
+        else:
+            self.static_scale = None
+            self.static_shift = None
+
+        # LayerNorm
+        self.norm = nn.LayerNorm(climate_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        # Alpha 参数：控制弱模态的贡献
+        if learnable_alpha:
+            self.alpha_visual = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+            if static_dim is not None:
+                self.alpha_static = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        else:
+            self.register_buffer('alpha_visual', torch.tensor(alpha_init, dtype=torch.float32))
+            if static_dim is not None:
+                self.register_buffer('alpha_static', torch.tensor(alpha_init, dtype=torch.float32))
+
+    def forward(
+        self,
+        climate_feat: torch.Tensor,
+        visual_feat: torch.Tensor,
+        static_feat: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            climate_feat: Climate 特征 [B, climate_dim]
+            visual_feat: Visual 特征 [B, visual_dim]
+            static_feat: Static 特征 [B, static_dim] (可选)
+
+        Returns:
+            fused_feat: 融合后的特征 [B, climate_dim]
+        """
+        # Visual FiLM 调制
+        v_scale = self.visual_scale(visual_feat)    # [B, climate_dim]
+        v_shift = self.visual_shift(visual_feat)    # [B, climate_dim]
+
+        # FiLM: gamma * x + beta
+        fused = climate_feat * (1 + self.alpha_visual * v_scale) + self.alpha_visual * v_shift
+
+        # Static FiLM 调制 (如果提供)
+        if static_feat is not None and self.static_scale is not None:
+            s_scale = self.static_scale(static_feat)
+            s_shift = self.static_shift(static_feat)
+            fused = fused * (1 + self.alpha_static * s_scale) + self.alpha_static * s_shift
+
+        # 归一化
+        fused = self.norm(fused)
+        fused = self.dropout(fused)
+
+        return fused
+
+    def get_alpha_values(self) -> dict:
+        """获取 alpha 参数值"""
+        alphas = {'visual': self.alpha_visual.item()}
+        if hasattr(self, 'alpha_static') and self.alpha_static is not None:
+            alphas['static'] = self.alpha_static.item()
         return alphas
 
 
@@ -464,7 +781,7 @@ if __name__ == '__main__':
     
     # 创建输入特征
     climate_feat = torch.randn(batch_size, climate_dim)
-    visual_feat = torch.randn(batch_size, visual_dim)
+    visual_feat = torch.randn(batch_size, 16, visual_dim)
     static_feat = torch.randn(batch_size, static_dim)
     
     # 前向传播
@@ -512,4 +829,3 @@ if __name__ == '__main__':
         f"形状不匹配: 期望 ({batch_size}, {seq_len}, {climate_dim}), 得到 {fused_seq.shape}"
     
     print("\n[SUCCESS] 所有测试通过!")
-

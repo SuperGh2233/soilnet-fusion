@@ -33,6 +33,8 @@ dataset/simclr_past/
 dataset/simclr_RaCA/
 dataset/l8_images_us/
 dataset/l8_images_simclr_RaCA/
+dataset/l8_images_*/
+dataset/*.zip
 
 # 结果和分析文件
 *.csv
@@ -62,7 +64,8 @@ Poster-IADF-GRSS-School/
 readme_imgs/
 plot_utils/figures/
 tools/
-ViT-CoMer/  # 第三方库，如果不需要可以排除
+# 第三方库，如果不需要可以排除
+ViT-CoMer/
 
 # 但保留关键代码文件（使用 ! 来覆盖上面的规则）
 !dataset/dataset_loader*.py

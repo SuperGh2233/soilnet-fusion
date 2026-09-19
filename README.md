@@ -1,4 +1,14 @@
-# SoilNet
+# SoilNet Fusion
+
+This repository is the canonical research and model-fusion codebase. The
+regional survey system is managed separately in
+[`SuperGh2233/soilnet-sys`](https://github.com/SuperGh2233/soilnet-sys); its
+backend, frontend, and model-service code are intentionally not part of this
+repository.
+
+The canonical model package is `soilnet/`. Local datasets, checkpoints, and
+experiment results stay outside Git and are described by the existing paths in
+`config.py`.
 
 A Hybrid Transformer-based Framework with Self-Supervised Learning for Large-scale Soil Organic Carbon Prediction has been presented - Accepted for publication in IEEE Transactions on Geoscience and Remote Sensing (TGRS). 
 The training consists of two phases: 
@@ -16,7 +26,7 @@ The training consists of two phases:
 First, you need to clone the repository to your local machine. You can do this using the following command:
 
 ```bash
-git clone https://github.com/moienr/SoilNet
+git clone https://github.com/SuperGh2233/soilnet-fusion
 ```
 
 Next, you should create two Conda environments: one for data preparation and acquisition using Google Earth Engine, and the other for the deep learning model. The environment configurations can be found in the requirements folder.

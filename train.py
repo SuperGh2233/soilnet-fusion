@@ -49,7 +49,7 @@ NUM_EPOCHS = 2
 LR_SCHEDULER = "step" # step, plateau or None
 USE_SRTM = False
 USE_SPATIAL_ATTENTION = False
-CNN_ARCHITECTURE = "ViT" # vgg16 or resnet101 or "ViT" or resnet50 or "ViT-CoMer" or "MPViT" or "HybridViT" or "ViT-CoMerV2"
+CNN_ARCHITECTURE = "ViT" # vgg16 or resnet101 or "ViT" or resnet50 or "ViT-CoMer" or "MPViT" or "HybridViT"
 RNN_ARCHITECTURE = None  # 默认不指定RNN架构，需要通过 -rnn 显式指定才会开启RNN分支
 IMG_ENCODER_TYPE = "cnn"  # 图像编码器类型：'cnn' (默认) 或 'spectral_cnn' (基于 Tziolas et al., Geoderma 2024)
 SPECTRAL_EMB_DIM = 32  # spectral_cnn 输出维度
@@ -82,7 +82,7 @@ def parse_arguments():
 	parser.add_argument('-ls', '--lr_scheduler', type=str, default=LR_SCHEDULER, choices=['step', 'plateau', 'None'], help='Learning rate scheduler')
 	parser.add_argument('-srtm', '--use_srtm', action='store_true', default=USE_SRTM, help='Use SRTM data')
 	parser.add_argument('-sa', '--use_spatial_attention', action='store_true', default=USE_SPATIAL_ATTENTION, help='Use spatial attention')
-	parser.add_argument('-cnn', '--cnn_architecture', type=str, default=CNN_ARCHITECTURE, choices=['vgg16', 'resnet101', 'ViT', 'resnet50', 'ViT-CoMer', 'MPViT', 'HybridViT', 'ViT-CoMerV2'], help='CNN architecture')
+	parser.add_argument('-cnn', '--cnn_architecture', type=str, default=CNN_ARCHITECTURE, choices=['vgg16', 'resnet101', 'ViT', 'resnet50', 'ViT-CoMer', 'ViT-CoMerV2', 'MPViT', 'HybridViT'], help='CNN architecture')
 	parser.add_argument('-rnn', '--rnn_architecture', type=str, default=None, choices=['LSTM', 'GRU', 'RNN', 'Transformer'], help='RNN architecture (if specified, will automatically enable RNN branch)')
 	# 图像编码器类型开关 - 基于 Tziolas et al. (Geoderma, 2024)
 	parser.add_argument('--img_encoder', type=str, default='cnn', choices=['cnn', 'spectral_cnn'],
@@ -133,6 +133,12 @@ def parse_arguments():
 						help='Temperature parameter for semantic alignment loss (default: 0.07)')
 	parser.add_argument('--scmrl_parallel', action='store_true', default=False,
 						help='Use parallel fusion instead of sequential fusion for S-CMRL (default: False, sequential)')
+
+	# FiLM 融合参数（Feature-wise Linear Modulation）
+	parser.add_argument('--use_film_fusion', action='store_true', default=False,
+						help='Use FiLM fusion (Feature-wise Linear Modulation) - more efficient than S-CMRL for 2D features')
+	parser.add_argument('--film_alpha_init', type=float, default=1.5,
+						help='Initial value for alpha parameter in FiLM fusion (default: 1.5)')
 
 	args = parser.parse_args()
 	return args
@@ -254,6 +260,10 @@ if __name__ == '__main__':
 	SCMRL_LAMBDA_ALIGN = args.scmrl_lambda_align
 	SCMRL_TEMPERATURE = args.scmrl_temperature
 	SCMRL_PARALLEL = args.scmrl_parallel
+
+	# FiLM 融合参数
+	USE_FILM_FUSION = args.use_film_fusion
+	FILM_ALPHA_INIT = args.film_alpha_init
 	
 	if LABEL_MODE in ['baseline_raw_mse', 'log1p_mse', 'log1p_huber', 'log1p_huber_w']:
 		# 四组消融实验：标签保持原尺度，不归一化，不clip
@@ -690,7 +700,7 @@ if __name__ == '__main__':
 		
 		#model = SoilNetFC(cnn_in_channels=12, regresor_input_from_cnn=1024, hidden_size=128).to(device)
 		# 根据CNN架构确定输出维度
-		if CNN_ARCHITECTURE in ['ViT-CoMer', 'ViT-CoMerV2', 'MPViT', 'HybridViT']:
+		if CNN_ARCHITECTURE in ['ViT-CoMer', 'MPViT', 'HybridViT']:
 			cnn_output_dim = 384
 		elif CNN_ARCHITECTURE == 'ViT':
 			cnn_output_dim = 768
@@ -804,7 +814,8 @@ if __name__ == '__main__':
 								use_regional_adaptation=args.use_regional_adaptation,
 								num_regions=args.num_regions,
 								img_encoder_type=IMG_ENCODER_TYPE,
-								spectral_cnn_emb_dim=SPECTRAL_EMB_DIM
+								spectral_cnn_emb_dim=SPECTRAL_EMB_DIM,
+								use_film_fusion=USE_FILM_FUSION
 							).to(device)
 					else:
 						from soilnet.soil_net import SoilNetLSTM
@@ -838,6 +849,7 @@ if __name__ == '__main__':
 							scmrl_alpha_init=SCMRL_ALPHA_INIT,
 							scmrl_temperature=SCMRL_TEMPERATURE,
 							scmrl_parallel=SCMRL_PARALLEL,
+							use_film_fusion=USE_FILM_FUSION,
 							static_dim=static_dim
 						).to(device)
 				else:
@@ -926,10 +938,12 @@ if __name__ == '__main__':
 		else:
 			# 准备对齐损失函数（如果使用 S-CMRL）
 			alignment_loss_fn = None
-			if USE_SCMRL_FUSION and hasattr(model, 'alignment_loss_fn'):
+			if USE_SCMRL_FUSION and hasattr(model, 'alignment_loss_fn') and model.alignment_loss_fn is not None:
 				alignment_loss_fn = model.alignment_loss_fn
 				print(f"[Info] S-CMRL 对齐损失已启用: lambda={SCMRL_LAMBDA_ALIGN}, temperature={SCMRL_TEMPERATURE}")
-			
+			elif USE_FILM_FUSION:
+				print(f"[Info] FiLM 融合已启用: alpha_init={FILM_ALPHA_INIT} (无对齐损失)")
+
 			results = train(model, train_dl, test_dl, val_dl,
 							optimizer,
 							loss_instance, epochs=NUM_EPOCHS, lr_scheduler=LR_SCHEDULER,
@@ -1037,12 +1051,16 @@ if __name__ == '__main__':
 	# 静态特征参数
 	cv_results_full['USE_STATIC_FEATURES'] = USE_STATIC_FEATURES
 	cv_results_full['STATIC_CSV'] = STATIC_CSV
-	
+
 	# 标签策略参数（消融实验）
 	cv_results_full['LABEL_MODE'] = LABEL_MODE
 	cv_results_full['HUBER_BETA'] = HUBER_BETA
 	cv_results_full['TAIL_THRESHOLD'] = TAIL_THRESHOLD
 	cv_results_full['TAIL_WEIGHT'] = TAIL_WEIGHT
+
+	# FiLM 融合参数
+	cv_results_full['USE_FILM_FUSION'] = USE_FILM_FUSION
+	cv_results_full['FILM_ALPHA_INIT'] = FILM_ALPHA_INIT if USE_FILM_FUSION else None
 
 
 	# 将 numpy 类型递归转换为 Python 原生类型，避免 JSON 序列化错误

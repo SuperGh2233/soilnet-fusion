@@ -322,11 +322,3 @@ if __name__ == '__main__':
     assert soc.shape == (4, 1), f"Expected (4, 1), got {soc.shape}"
     
     print("\n✅ All tests passed!")
-
-
-
-
-
-
-
-

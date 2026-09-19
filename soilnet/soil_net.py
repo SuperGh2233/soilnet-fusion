@@ -13,7 +13,8 @@ from submodules.vit_hybrid import HybridViT
 from submodules.regressor import Regressor, MultiHeadRegressor
 from submodules.spectral_enhancement import SpectralEnhancer
 from submodules.spectral_cnn import MultiPreprocSpectralCNN  # 基于 Tziolas et al. (Geoderma, 2024)
-from submodules.semantic_aligned_fusion import SemanticAlignedFusion, SemanticAlignedFusionParallel, SemanticAlignmentLoss  # S-CMRL 融合
+from submodules.semantic_aligned_fusion import LegacySemanticAlignedFusion, LegacySemanticAlignedFusionParallel, SemanticAlignedFusion, SemanticAlignedFusionParallel, SemanticAlignmentLoss, FiLMFusion  # S-CMRL/FiLM 融合
+from submodules.semantic_aligned_fusion import CheckpointCompatibleFusion
 from typing import Tuple, Optional
 from submodules.src.transformer.transformer import TSTransformerEncoderClassiregressor
 from submodules import rnn
@@ -336,6 +337,9 @@ class SoilNetLSTM(nn.Module):
                  scmrl_alpha_init: float = 1.5,
                  scmrl_temperature: float = 0.07,
                  scmrl_parallel: bool = False,  # 是否使用并行融合（默认False为串行）
+                 scmrl_legacy: bool = False,
+                 scmrl_checkpoint_compatible: bool = False,
+                 use_film_fusion: bool = False,  # 是否使用 FiLM 融合
                  static_dim: Optional[int] = None):
         
         super().__init__()
@@ -351,6 +355,9 @@ class SoilNetLSTM(nn.Module):
         # S-CMRL 融合选项
         self.use_scmrl_fusion = bool(use_scmrl_fusion)
         self.scmrl_parallel = bool(scmrl_parallel) if use_scmrl_fusion else False
+        self.scmrl_legacy = bool(scmrl_legacy) if use_scmrl_fusion else False
+        self.scmrl_checkpoint_compatible = bool(scmrl_checkpoint_compatible) if use_scmrl_fusion else False
+        self.use_film_fusion = bool(use_film_fusion)
         
         # ========== 图像编码器选择 ==========
         # 基于 Tziolas et al. (Geoderma, 2024) 的多预处理光谱 CNN
@@ -443,17 +450,54 @@ class SoilNetLSTM(nn.Module):
             self.region_embedding = None
 
         # S-CMRL 融合模块（如果启用）
-        if self.use_scmrl_fusion:
-            fusion_type = "Parallel" if self.scmrl_parallel else "Sequential"
+        if self.use_scmrl_fusion and not self.use_film_fusion:
+            visual_fusion_dim = (
+                regresor_input_from_cnn
+                if self.scmrl_legacy or self.scmrl_checkpoint_compatible
+                else getattr(self.cnn, "token_dim", regresor_input_from_cnn)
+            )
+            if self.scmrl_legacy:
+                fusion_type = "Legacy parallel vector-input" if self.scmrl_parallel else "Legacy sequential vector-input"
+            else:
+                fusion_type = "Parallel" if self.scmrl_parallel else "Sequential"
             print(f"[Info] Using S-CMRL Fusion (Semantic-Alignment Cross-Modal Residual Learning)")
             print(f"       Mode: {fusion_type} fusion")
-            print(f"       alpha_init={scmrl_alpha_init}, temperature={scmrl_temperature}")
+            print(f"       alpha_init={scmrl_alpha_init}, pre_norm=False, temperature={scmrl_temperature}")
             
             # 创建融合模块（串行或并行）
-            if self.scmrl_parallel:
+            if self.scmrl_checkpoint_compatible:
+                self.fusion = CheckpointCompatibleFusion(
+                    climate_dim=lstm_out,
+                    visual_dim=visual_fusion_dim,
+                    static_dim=static_dim,
+                    num_heads=8,
+                    alpha_init=scmrl_alpha_init,
+                    dropout=0.1
+                )
+            elif self.scmrl_legacy and self.scmrl_parallel:
+                self.fusion = LegacySemanticAlignedFusionParallel(
+                    climate_dim=lstm_out,
+                    visual_dim=visual_fusion_dim,
+                    static_dim=static_dim,
+                    num_heads=8,
+                    alpha_init=scmrl_alpha_init,
+                    learnable_alpha=True,
+                    dropout=0.1
+                )
+            elif self.scmrl_legacy:
+                self.fusion = LegacySemanticAlignedFusion(
+                    climate_dim=lstm_out,
+                    visual_dim=visual_fusion_dim,
+                    static_dim=static_dim,
+                    num_heads=8,
+                    alpha_init=scmrl_alpha_init,
+                    learnable_alpha=True,
+                    dropout=0.1
+                )
+            elif self.scmrl_parallel:
                 self.fusion = SemanticAlignedFusionParallel(
                     climate_dim=lstm_out,
-                    visual_dim=regresor_input_from_cnn,
+                    visual_dim=visual_fusion_dim,
                     static_dim=static_dim,
                     num_heads=8,
                     alpha_init=scmrl_alpha_init,
@@ -463,7 +507,7 @@ class SoilNetLSTM(nn.Module):
             else:
                 self.fusion = SemanticAlignedFusion(
                     climate_dim=lstm_out,
-                    visual_dim=regresor_input_from_cnn,
+                    visual_dim=visual_fusion_dim,
                     static_dim=static_dim,
                     num_heads=8,
                     alpha_init=scmrl_alpha_init,
@@ -478,6 +522,24 @@ class SoilNetLSTM(nn.Module):
             reg_input_dim = lstm_out
             if self.use_regional_adaptation:
                 # 如果有区域自适应，需要额外处理
+                reg_input_dim = lstm_out + self.region_embed_dim
+            self.reg = nn.Linear(reg_input_dim, 1)
+        elif self.use_film_fusion:
+            print(f"[Info] Using FiLM Fusion (Feature-wise Linear Modulation)")
+            print(f"       alpha_init={scmrl_alpha_init}")
+
+            self.fusion = FiLMFusion(
+                climate_dim=lstm_out,
+                visual_dim=regresor_input_from_cnn,
+                static_dim=static_dim,
+                alpha_init=scmrl_alpha_init,
+                learnable_alpha=True,
+                dropout=0.1
+            )
+            self.alignment_loss_fn = None
+
+            reg_input_dim = lstm_out
+            if self.use_regional_adaptation:
                 reg_input_dim = lstm_out + self.region_embed_dim
             self.reg = nn.Linear(reg_input_dim, 1)
         else:
@@ -646,6 +708,26 @@ class SoilNetLSTM(nn.Module):
             import traceback
             traceback.print_exc()
         
+    def _get_fusion_visual_features(self, global_feature, spatial_tokens):
+        return global_feature if self.scmrl_checkpoint_compatible else spatial_tokens
+
+    def _extract_visual_features(self, raster_stack: torch.Tensor):
+        if self.use_scmrl_fusion and not self.scmrl_legacy and not self.scmrl_checkpoint_compatible:
+            if not getattr(self.cnn, "supports_spatial_tokens", False):
+                # 保留本地实验对 ResNet/光谱 CNN 等向量编码器的兼容性；
+                # CrossModalResidualBlock 会把单向量作为一个 token 处理。
+                global_feature = self.cnn(raster_stack)
+                return global_feature, global_feature
+            global_feature, spatial_tokens = self.cnn(raster_stack, return_tokens=True)
+            if spatial_tokens.dim() != 3 or spatial_tokens.size(1) < 2:
+                raise ValueError(
+                    f"Expected visual tokens with shape [B, N, D] and N > 1, got "
+                    f"{tuple(spatial_tokens.shape)}."
+                )
+            return global_feature, self._get_fusion_visual_features(global_feature, spatial_tokens)
+        global_feature = self.cnn(raster_stack)
+        return global_feature, global_feature
+
     def forward(self, input_raster_ts: Tuple[torch.Tensor, torch.Tensor], region_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Inputs
@@ -668,22 +750,22 @@ class SoilNetLSTM(nn.Module):
             raise ValueError("input_raster_ts 应为包含(影像, 气候)的 tuple/list")
         if self.use_spectral_enhance:
             raster_stack = self.spectral(raster_stack)
-        flat_raster = self.cnn(raster_stack)
+        flat_raster, visual_fusion_features = self._extract_visual_features(raster_stack)
         lstm_output = self.lstm(ts_features)
         
         # 保存中间特征（用于对齐损失计算）
         self._last_climate_feat = lstm_output
-        self._last_visual_feat = flat_raster
+        self._last_visual_feat = visual_fusion_features
         
         # S-CMRL 融合或原有融合方式
-        if self.use_scmrl_fusion:
-            # 使用 S-CMRL 融合
+        if self.use_scmrl_fusion or self.use_film_fusion:
+            # 使用 S-CMRL 或 FiLM 融合
             # 注意：这里假设 static_feat 在 input_raster_ts 的第三个元素（如果有）
             static_feat = None
             if isinstance(input_raster_ts, (list, tuple)) and len(input_raster_ts) >= 3:
                 static_feat = input_raster_ts[2]
             
-            fused_feat = self.fusion(lstm_output, flat_raster, static_feat)
+            fused_feat = self.fusion(lstm_output, visual_fusion_features, static_feat)
             
             # 如果有区域自适应，需要额外处理
             if self.use_regional_adaptation and (region_ids is not None) and (self.region_embedding is not None):

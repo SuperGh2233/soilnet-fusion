@@ -127,6 +127,8 @@ class ViTCoMer(nn.Module):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
+        self.token_dim = embed_dim
+        self.supports_spatial_tokens = True
         
         self.patch_embed = PatchEmbed(in_chans, embed_dim, patch_size, img_size)
         self.cnn = CNNExtractor(in_chans, out_chans=embed_dim)
@@ -151,13 +153,18 @@ class ViTCoMer(nn.Module):
         elif isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
-    def forward(self, x):
+    def forward_features(self, x):
         x_vit = self.patch_embed(x) 
         x_cnn = self.cnn(x)
         Hp = Wp = self.img_size // self.patch_size
         x_fused = self.cti(x_cnn, x_vit, Hp, Wp)
         for blk in self.blocks:
             x_fused = blk(x_fused)
-        x_out = self.norm(x_fused)
-        x_out = x_out.mean(dim=1) 
-        return self.head(x_out)
+        return self.norm(x_fused)
+
+    def forward(self, x, return_tokens=False):
+        spatial_tokens = self.forward_features(x)
+        global_feature = self.head(spatial_tokens.mean(dim=1))
+        if return_tokens:
+            return global_feature, spatial_tokens
+        return global_feature
