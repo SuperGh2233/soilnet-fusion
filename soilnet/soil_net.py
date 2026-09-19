@@ -13,7 +13,7 @@ from submodules.vit_hybrid import HybridViT
 from submodules.regressor import Regressor, MultiHeadRegressor
 from submodules.spectral_enhancement import SpectralEnhancer
 from submodules.spectral_cnn import MultiPreprocSpectralCNN  # 基于 Tziolas et al. (Geoderma, 2024)
-from submodules.semantic_aligned_fusion import LegacySemanticAlignedFusion, LegacySemanticAlignedFusionParallel, SemanticAlignedFusion, SemanticAlignedFusionParallel, SemanticAlignmentLoss, FiLMFusion  # S-CMRL/FiLM 融合
+from submodules.semantic_aligned_fusion import LegacySemanticAlignedFusion, LegacySemanticAlignedFusionParallel, SemanticAlignedFusion, SemanticAlignedFusionParallel, SemanticAlignmentLoss, FiLMFusion, GatedFeatureFusion, TokenCrossAttentionFusion  # S-CMRL/FiLM/baseline fusion
 from submodules.semantic_aligned_fusion import CheckpointCompatibleFusion
 from typing import Tuple, Optional
 from submodules.src.transformer.transformer import TSTransformerEncoderClassiregressor
@@ -340,6 +340,7 @@ class SoilNetLSTM(nn.Module):
                  scmrl_legacy: bool = False,
                  scmrl_checkpoint_compatible: bool = False,
                  use_film_fusion: bool = False,  # 是否使用 FiLM 融合
+                 fusion_baseline: Optional[str] = None,
                  static_dim: Optional[int] = None):
         
         super().__init__()
@@ -358,6 +359,11 @@ class SoilNetLSTM(nn.Module):
         self.scmrl_legacy = bool(scmrl_legacy) if use_scmrl_fusion else False
         self.scmrl_checkpoint_compatible = bool(scmrl_checkpoint_compatible) if use_scmrl_fusion else False
         self.use_film_fusion = bool(use_film_fusion)
+        self.fusion_baseline = fusion_baseline
+        if fusion_baseline not in (None, 'gated', 'cross_attention'):
+            raise ValueError("fusion_baseline must be None, 'gated', or 'cross_attention'")
+        if fusion_baseline and (self.use_scmrl_fusion or self.use_film_fusion):
+            raise ValueError('fusion_baseline cannot be combined with S-CMRL or FiLM')
         
         # ========== 图像编码器选择 ==========
         # 基于 Tziolas et al. (Geoderma, 2024) 的多预处理光谱 CNN
@@ -542,6 +548,27 @@ class SoilNetLSTM(nn.Module):
             if self.use_regional_adaptation:
                 reg_input_dim = lstm_out + self.region_embed_dim
             self.reg = nn.Linear(reg_input_dim, 1)
+        elif self.fusion_baseline:
+            visual_fusion_dim = (
+                getattr(self.cnn, "token_dim", regresor_input_from_cnn)
+                if self.fusion_baseline == 'cross_attention'
+                else regresor_input_from_cnn
+            )
+            fusion_class = (
+                TokenCrossAttentionFusion
+                if self.fusion_baseline == 'cross_attention'
+                else GatedFeatureFusion
+            )
+            self.fusion = fusion_class(
+                climate_dim=lstm_out,
+                visual_dim=visual_fusion_dim,
+                static_dim=static_dim,
+                dropout=0.1,
+            )
+            self.alignment_loss_fn = None
+            reg_input_dim = lstm_out + (self.region_embed_dim if self.use_regional_adaptation else 0)
+            self.reg = nn.Linear(reg_input_dim, 1)
+            print(f"[Info] Using {self.fusion_baseline} fusion baseline")
         else:
             # 原有的 MultiHeadRegressor
             reg_input_dims = [regresor_input_from_cnn, lstm_out]
@@ -712,7 +739,11 @@ class SoilNetLSTM(nn.Module):
         return global_feature if self.scmrl_checkpoint_compatible else spatial_tokens
 
     def _extract_visual_features(self, raster_stack: torch.Tensor):
-        if self.use_scmrl_fusion and not self.scmrl_legacy and not self.scmrl_checkpoint_compatible:
+        needs_tokens = (
+            (self.use_scmrl_fusion and not self.scmrl_legacy and not self.scmrl_checkpoint_compatible)
+            or self.fusion_baseline == 'cross_attention'
+        )
+        if needs_tokens:
             if not getattr(self.cnn, "supports_spatial_tokens", False):
                 # 保留本地实验对 ResNet/光谱 CNN 等向量编码器的兼容性；
                 # CrossModalResidualBlock 会把单向量作为一个 token 处理。
@@ -758,7 +789,7 @@ class SoilNetLSTM(nn.Module):
         self._last_visual_feat = visual_fusion_features
         
         # S-CMRL 融合或原有融合方式
-        if self.use_scmrl_fusion or self.use_film_fusion:
+        if self.use_scmrl_fusion or self.use_film_fusion or self.fusion_baseline:
             # 使用 S-CMRL 或 FiLM 融合
             # 注意：这里假设 static_feat 在 input_raster_ts 的第三个元素（如果有）
             static_feat = None

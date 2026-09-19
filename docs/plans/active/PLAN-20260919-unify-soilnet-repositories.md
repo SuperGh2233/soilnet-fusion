@@ -124,11 +124,11 @@ and model-service code separately.
 - `git diff --check` passed for all files touched by this plan; unrelated
   pre-existing blank-at-EOF warnings remain in other local files.
 - Local `main` and `origin/main` matched after publication at
-  `27df66d3597224af4e1b23221d1f12de9cb63e43`; the original GitHub remote is
+  `09861e7f830329372acec8a57d0b144186ef58d8`; the original GitHub remote is
   retained as `upstream-original` and the Gitee remote is retained as `gitee`.
 
 ## Status and next action
 
 Status: completed. The fusion source is published at
-`SuperGh2233/soilnet-fusion@27df66d3597224af4e1b23221d1f12de9cb63e43`; the
+`SuperGh2233/soilnet-fusion@09861e7f830329372acec8a57d0b144186ef58d8`; the
 system application remains in `SuperGh2233/soilnet-sys`.

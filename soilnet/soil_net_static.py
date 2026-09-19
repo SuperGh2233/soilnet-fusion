@@ -32,9 +32,10 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
         # 因为StaticBranch会将静态特征编码为hidden_size维度
         use_scmrl = kwargs.get('use_scmrl_fusion', False)
         use_film = kwargs.get('use_film_fusion', False)
+        use_baseline_fusion = kwargs.get('fusion_baseline') is not None
         hidden_size = kwargs.get('hidden_size', 128)
         static_hidden_dim = kwargs.get('lstm_out', hidden_size) if kwargs.get('scmrl_checkpoint_compatible', False) else hidden_size
-        if (use_scmrl or use_film) and static_feature_dim > 0:
+        if (use_scmrl or use_film or use_baseline_fusion) and static_feature_dim > 0:
             # 编码后的静态特征维度 = hidden_size（StaticBranch的输出维度）
             kwargs['static_dim'] = hidden_size
         
@@ -70,7 +71,7 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
             # 检查是否使用SCMRL fusion（父类已经初始化了use_scmrl_fusion属性）
             use_scmrl = getattr(self, 'use_scmrl_fusion', False)
             
-            if use_scmrl or getattr(self, 'use_film_fusion', False):
+            if use_scmrl or getattr(self, 'use_film_fusion', False) or getattr(self, 'fusion_baseline', None):
                 # 如果使用SCMRL fusion，回归器接收融合后的单一特征向量（维度为lstm_out）
                 reg_input_dim = lstm_dim
                 if self.use_regional_adaptation and getattr(self, "region_embedding", None) is not None:
@@ -135,12 +136,12 @@ class SoilNetLSTMWithStatic(SoilNetLSTM):
         climate_features = self.lstm(ts_features)  # [B, lstm_dim]
         
         # 保存中间特征（用于对齐损失计算，如果使用SCMRL）
-        if (hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion) or getattr(self, 'use_film_fusion', False):
+        if (hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion) or getattr(self, 'use_film_fusion', False) or getattr(self, 'fusion_baseline', None):
             self._last_climate_feat = climate_features
             self._last_visual_feat = visual_fusion_features
         
         # S-CMRL 融合或原有融合方式
-        if (hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion) or getattr(self, 'use_film_fusion', False):
+        if (hasattr(self, 'use_scmrl_fusion') and self.use_scmrl_fusion) or getattr(self, 'use_film_fusion', False) or getattr(self, 'fusion_baseline', None):
             # 使用 S-CMRL 融合（静态特征会参与融合）
             # 先使用StaticBranch编码静态特征
             static_encoded = None

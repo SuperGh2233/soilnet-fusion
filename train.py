@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import random
 import numpy as np
+import pandas as pd
 from dataset.utils.utils import TextColors as tc
 from plot_utils.plot import plot_train_test_losses
 from datetime import date, datetime
@@ -18,6 +19,7 @@ import train_utils
 from train_utils import *
 from datetime import date, datetime
 import argparse
+from pathlib import Path
 # Format the date and time
 # create a folder called 'results' in the current directory if it doesn't exist
 if not os.path.exists('results'):
@@ -139,6 +141,19 @@ def parse_arguments():
 						help='Use FiLM fusion (Feature-wise Linear Modulation) - more efficient than S-CMRL for 2D features')
 	parser.add_argument('--film_alpha_init', type=float, default=1.5,
 						help='Initial value for alpha parameter in FiLM fusion (default: 1.5)')
+	parser.add_argument('--scmrl_legacy', action='store_true', default=False,
+						help='Use the vector-input SAP-RF implementation used by the submitted 0.5404 run')
+	parser.add_argument('--split_manifest', type=str, default=None,
+						help='CSV manifest with Point_id and split columns (train/val/test)')
+	parser.add_argument('--image_root', type=str, default=None,
+						help='Shared image directory used with --split_manifest')
+	parser.add_argument('--train_only_preprocessing', action='store_true', default=False,
+						help='Fit climate/static preprocessing statistics using training Point_ids only')
+	parser.add_argument('--revision_output_dir', type=str, default='revision_outputs/runs',
+						help='Directory for per-seed revision predictions and preprocessing metadata')
+	parser.add_argument('--revision_fusion', type=str, default=None,
+						choices=['concat', 'sap_rf', 'gated', 'cross_attention', 'film'],
+						help='Fusion strategy for controlled GRSL revision comparisons')
 
 	args = parser.parse_args()
 	return args
@@ -228,6 +243,34 @@ if __name__ == '__main__':
 		except Exception:
 			HAS_STATIC_DS = False
 		OC_MAX = 60.0
+
+	SPLIT_POINT_IDS = None
+	FIT_PREPROCESSING_ON_TRAIN = bool(args.train_only_preprocessing)
+	REVISION_PROTOCOL = bool(args.split_manifest or args.train_only_preprocessing)
+	if args.split_manifest:
+		if DATASET != 'CHINA':
+			raise ValueError('--split_manifest currently supports only the CHINA dataset')
+		manifest_df = pd.read_csv(args.split_manifest)
+		required_manifest_cols = {'Point_id', 'split'}
+		if not required_manifest_cols.issubset(manifest_df.columns):
+			raise ValueError(f"Split manifest must contain {sorted(required_manifest_cols)}")
+		manifest_df['Point_id'] = manifest_df['Point_id'].astype(str).str.replace('.0', '', regex=False).str.strip()
+		SPLIT_POINT_IDS = {
+			name: set(manifest_df.loc[manifest_df['split'] == name, 'Point_id'])
+			for name in ('train', 'val', 'test')
+		}
+		if any(not values for values in SPLIT_POINT_IDS.values()):
+			raise ValueError('Split manifest must contain non-empty train, val, and test subsets')
+		shared_image_root = args.image_root or 'dataset/l8_images_CN'
+		if not os.path.isdir(shared_image_root):
+			raise FileNotFoundError(f'Image root not found: {shared_image_root}')
+		train_l8_folder_path = shared_image_root
+		val_l8_folder_path = shared_image_root
+		test_l8_folder_path = shared_image_root
+		FIT_PREPROCESSING_ON_TRAIN = True
+		print(f"[Revision] Loaded split manifest: {args.split_manifest}")
+		print('[Revision] Split sizes: ' + ', '.join(f"{name}={len(ids)}" for name, ids in SPLIT_POINT_IDS.items()))
+		print('[Revision] Climate/static preprocessing will be fitted on training IDs only')
   
 
 	if JUST_LSTM:
@@ -260,10 +303,21 @@ if __name__ == '__main__':
 	SCMRL_LAMBDA_ALIGN = args.scmrl_lambda_align
 	SCMRL_TEMPERATURE = args.scmrl_temperature
 	SCMRL_PARALLEL = args.scmrl_parallel
+	SCMRL_LEGACY = args.scmrl_legacy
 
 	# FiLM 融合参数
 	USE_FILM_FUSION = args.use_film_fusion
 	FILM_ALPHA_INIT = args.film_alpha_init
+	REVISION_FUSION = args.revision_fusion
+	FUSION_BASELINE = None
+	if REVISION_FUSION:
+		USE_SCMRL_FUSION = REVISION_FUSION == 'sap_rf'
+		USE_FILM_FUSION = REVISION_FUSION == 'film'
+		FUSION_BASELINE = REVISION_FUSION if REVISION_FUSION in ('gated', 'cross_attention') else None
+		if USE_SCMRL_FUSION:
+			SCMRL_PARALLEL = True
+			SCMRL_LEGACY = True
+		print(f"[Revision] Controlled fusion mode: {REVISION_FUSION}")
 	
 	if LABEL_MODE in ['baseline_raw_mse', 'log1p_mse', 'log1p_huber', 'log1p_huber_w']:
 		# 四组消融实验：标签保持原尺度，不归一化，不clip
@@ -307,42 +361,61 @@ if __name__ == '__main__':
 
 	bands = [0,1,2,3,4,5,6,7,8,9,10,11] if not USE_SRTM else [0,1,2,3,4,5,6,7,8,9,10,11,12,13]
 
+	def split_ids(name):
+		return None if SPLIT_POINT_IDS is None else SPLIT_POINT_IDS[name]
 
 	################################# IF Not USE_LSTM_BRANCH ###############################
 	if not USE_LSTM_BRANCH: # NOT USING THE CLIMATE DATA
-
-		train_ds = SNDataset(train_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=train_transform)
-		test_ds =  SNDataset(test_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=test_transform)
-		val_ds = SNDataset(val_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=test_transform)
-		test_ds_w_id =  SNDataset(test_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=test_transform, return_point_id=True)
+		point_id_kwargs = ({'point_ids': split_ids('train')} if DATASET == 'CHINA' else {})
+		train_ds = SNDataset(train_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=train_transform, **point_id_kwargs)
+		point_id_kwargs = ({'point_ids': split_ids('test')} if DATASET == 'CHINA' else {})
+		test_ds = SNDataset(test_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=test_transform, **point_id_kwargs)
+		point_id_kwargs = ({'point_ids': split_ids('val')} if DATASET == 'CHINA' else {})
+		val_ds = SNDataset(val_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=test_transform, **point_id_kwargs)
+		point_id_kwargs = ({'point_ids': split_ids('test')} if DATASET == 'CHINA' else {})
+		test_ds_w_id = SNDataset(test_l8_folder_path, lucas_csv_path,l8_bands=bands, transform=test_transform, return_point_id=True, **point_id_kwargs)
 		
 	################################### IF USE_LSTM_BRANCH #################################
 	else: # USING THE CLIMATE DATA
 		# 如果启用了静态特征开关且提供了静态特征CSV且模块可用，则使用带静态特征的数据集
 		if USE_STATIC_FEATURES and ('HAS_STATIC_DS' in locals()) and HAS_STATIC_DS and (STATIC_CSV is not None) and (STATIC_CSV != '') and os.path.exists(STATIC_CSV):
 			train_ds = ChinaSNDatasetClimateStatic(train_l8_folder_path,
-												lucas_csv_path,
-												climate_csv_folder_path,
-												static_csv_path=STATIC_CSV,
-												l8_bands=bands, transform=train_transform)
+											lucas_csv_path,
+											climate_csv_folder_path,
+											static_csv_path=STATIC_CSV,
+											l8_bands=bands, transform=train_transform,
+											point_ids=split_ids('train'),
+											fit_climate_stats=FIT_PREPROCESSING_ON_TRAIN,
+											fit_static_stats=FIT_PREPROCESSING_ON_TRAIN)
+			climate_stats = train_ds.get_climate_stats() if FIT_PREPROCESSING_ON_TRAIN else None
+			static_stats = train_ds.get_static_stats() if FIT_PREPROCESSING_ON_TRAIN else None
 
 			test_ds = ChinaSNDatasetClimateStatic(test_l8_folder_path,
-											lucas_csv_path,
-											climate_csv_folder_path,
-											static_csv_path=STATIC_CSV,
-											l8_bands=bands, transform=test_transform)
+										lucas_csv_path,
+										climate_csv_folder_path,
+										static_csv_path=STATIC_CSV,
+										l8_bands=bands, transform=test_transform,
+										point_ids=split_ids('test'),
+										climate_stats=climate_stats,
+										static_stats=static_stats)
 			
 			val_ds = ChinaSNDatasetClimateStatic(val_l8_folder_path,
-											lucas_csv_path,
-											climate_csv_folder_path,
-											static_csv_path=STATIC_CSV,
-											l8_bands=bands, transform=test_transform)
+										lucas_csv_path,
+										climate_csv_folder_path,
+										static_csv_path=STATIC_CSV,
+										l8_bands=bands, transform=test_transform,
+										point_ids=split_ids('val'),
+										climate_stats=climate_stats,
+										static_stats=static_stats)
 			
 			test_ds_w_id = ChinaSNDatasetClimateStatic(test_l8_folder_path,
-											lucas_csv_path,
-											climate_csv_folder_path,
-											static_csv_path=STATIC_CSV,
-											l8_bands=bands, transform=test_transform, return_point_id=True)
+										lucas_csv_path,
+										climate_csv_folder_path,
+										static_csv_path=STATIC_CSV,
+										l8_bands=bands, transform=test_transform, return_point_id=True,
+										point_ids=split_ids('test'),
+										climate_stats=climate_stats,
+										static_stats=static_stats)
 			USING_STATIC_FEATURES = True
 		else:
 			train_ds = SNDatasetClimate(
@@ -350,15 +423,18 @@ if __name__ == '__main__':
 				lucas_csv_path,
 				climate_csv_folder_path,
 				l8_bands=bands,
-				transform=train_transform
+				transform=train_transform,
+				**({'point_ids': split_ids('train'), 'fit_climate_stats': FIT_PREPROCESSING_ON_TRAIN} if DATASET == 'CHINA' else {})
 			)
+			climate_stats = train_ds.get_climate_stats() if DATASET == 'CHINA' and FIT_PREPROCESSING_ON_TRAIN else None
 
 			test_ds = SNDatasetClimate(
 				test_l8_folder_path,
 				lucas_csv_path,
 				climate_csv_folder_path,
 				l8_bands=bands,
-				transform=test_transform
+				transform=test_transform,
+				**({'point_ids': split_ids('test'), 'climate_stats': climate_stats} if DATASET == 'CHINA' else {})
 			)
 			
 			val_ds = SNDatasetClimate(
@@ -366,7 +442,8 @@ if __name__ == '__main__':
 				lucas_csv_path,
 				climate_csv_folder_path,
 				l8_bands=bands,
-				transform=test_transform
+				transform=test_transform,
+				**({'point_ids': split_ids('val'), 'climate_stats': climate_stats} if DATASET == 'CHINA' else {})
 			)
 			
 			test_ds_w_id = SNDatasetClimate(
@@ -375,7 +452,8 @@ if __name__ == '__main__':
 				climate_csv_folder_path,
 				l8_bands=bands,
 				transform=test_transform,
-				return_point_id=True
+				return_point_id=True,
+				**({'point_ids': split_ids('test'), 'climate_stats': climate_stats} if DATASET == 'CHINA' else {})
 			)
 			USING_STATIC_FEATURES = False
 
@@ -465,6 +543,9 @@ if __name__ == '__main__':
 				"MAE": [],
 				"RMSE": [],
 				"R2": [],
+				"best_epoch": [],
+				"best_val_loss": [],
+				"alpha_values": [],
 				"train_MAE": [],
 					"train_RMSE": [],
 					"train_R2": []
@@ -478,6 +559,20 @@ if __name__ == '__main__':
 	# create a folder called 'results' in the current directory if it doesn't exist
 	if not os.path.exists('results'):
 		os.mkdir('results')
+	revision_run_dir = None
+	if REVISION_PROTOCOL:
+		revision_run_dir = Path(args.revision_output_dir) / f"{EXP_NAME}_{run_name}"
+		revision_run_dir.mkdir(parents=True, exist_ok=True)
+		preprocessing_metadata = {
+			'split_manifest': str(Path(args.split_manifest).resolve()) if args.split_manifest else None,
+			'image_root': str(Path(train_l8_folder_path).resolve()),
+			'train_only_preprocessing': FIT_PREPROCESSING_ON_TRAIN,
+			'climate_stats': getattr(train_ds, 'get_climate_stats', lambda: None)(),
+			'static_stats': getattr(train_ds, 'get_static_stats', lambda: None)(),
+			'split_sizes': {name: len(ids) for name, ids in SPLIT_POINT_IDS.items()} if SPLIT_POINT_IDS else None,
+		}
+		with open(revision_run_dir / 'preprocessing.json', 'w', encoding='utf-8') as fp:
+			json.dump(preprocessing_metadata, fp, indent=2, ensure_ascii=False)
 		
 		
 		
@@ -748,10 +843,18 @@ if __name__ == '__main__':
 								scmrl_alpha_init=SCMRL_ALPHA_INIT,
 								scmrl_temperature=SCMRL_TEMPERATURE,
 								scmrl_parallel=SCMRL_PARALLEL,
+								scmrl_legacy=SCMRL_LEGACY,
+								use_film_fusion=USE_FILM_FUSION,
+								fusion_baseline=FUSION_BASELINE,
 								# static_dim 会在模型内部根据SCMRL fusion自动设置，不需要手动传递
 							).to(device)
 							print(f"Using static features (numeric_dim={static_numeric_dim}, lulc_classes={lulc_classes}) in model.")
 						except Exception as e:
+							if REVISION_PROTOCOL:
+								raise RuntimeError(
+									"Revision runs require the static-feature model; refusing to "
+									"silently fall back to a different dataset/model protocol."
+								) from e
 							print(f"Warning: Failed to import static model, fallback to standard SoilNetLSTM. Error: {e}")
 							print("Warning: Recreating datasets without static features to match model...")
 							# 重新创建标准数据集（不包含静态特征）
@@ -849,7 +952,9 @@ if __name__ == '__main__':
 							scmrl_alpha_init=SCMRL_ALPHA_INIT,
 							scmrl_temperature=SCMRL_TEMPERATURE,
 							scmrl_parallel=SCMRL_PARALLEL,
+							scmrl_legacy=SCMRL_LEGACY,
 							use_film_fusion=USE_FILM_FUSION,
+							fusion_baseline=FUSION_BASELINE,
 							static_dim=static_dim
 						).to(device)
 				else:
@@ -955,7 +1060,8 @@ if __name__ == '__main__':
 							tail_threshold=TAIL_THRESHOLD,
 							tail_weight=TAIL_WEIGHT,
 							alignment_loss_fn=alignment_loss_fn,
-							lambda_align=SCMRL_LAMBDA_ALIGN
+							lambda_align=SCMRL_LAMBDA_ALIGN,
+							select_best_on_val=REVISION_PROTOCOL
 							)
 
 		
@@ -964,6 +1070,41 @@ if __name__ == '__main__':
 		cv_results['MAE'].append(results['MAE'][0])
 		cv_results['RMSE'].append(results['RMSE'][0])
 		cv_results['R2'].append(results['R2'][0])
+		cv_results['best_epoch'].append(results.get('best_epoch'))
+		cv_results['best_val_loss'].append(results.get('best_val_loss'))
+		alpha_values = None
+		if hasattr(model, 'fusion') and hasattr(model.fusion, 'get_alpha_values'):
+			alpha_values = model.fusion.get_alpha_values()
+		cv_results['alpha_values'].append(alpha_values)
+
+		if REVISION_PROTOCOL:
+			seed_prediction_path = revision_run_dir / f'seed_{seed}_predictions.csv'
+			seed_test_loader = DataLoader(
+				test_ds_w_id,
+				batch_size=TEST_BATCH_SIZE,
+				shuffle=False,
+				num_workers=NUM_WORKERS,
+			)
+			test_step_w_id(
+				model=model,
+				data_loader=seed_test_loader,
+				loss_fn=nn.L1Loss(),
+				verbose=False,
+				csv_file=str(seed_prediction_path),
+				region_ids=test_region_ids if args.use_regional_adaptation else None,
+				label_mode=LABEL_MODE,
+			)
+			with open(revision_run_dir / f'seed_{seed}_metadata.json', 'w', encoding='utf-8') as fp:
+				json.dump({
+					'seed': seed,
+					'best_epoch': results.get('best_epoch'),
+					'best_val_loss': results.get('best_val_loss'),
+					'MAE': float(results['MAE'][0]),
+					'RMSE': float(results['RMSE'][0]),
+					'R2': float(results['R2'][0]),
+					'alpha_values': alpha_values,
+					'predictions': str(seed_prediction_path.resolve()),
+				}, fp, indent=2, ensure_ascii=False)
 		
 		if SAVE_TRAIN_DATA_METRICS:
 			cv_results['train_MAE'].append(results['train_MAE'])
@@ -971,7 +1112,7 @@ if __name__ == '__main__':
 			cv_results['train_R2'].append(results['train_R2'])
 		
 		# Stop the training loop via RMSE 
-		if results['RMSE'][0] < best_rmse:
+		if not REVISION_PROTOCOL and results['RMSE'][0] < best_rmse:
 			best_rmse = results['RMSE'][0]
 			best_seed = seed
 			print(tc.BOLD_BAKGROUNDs.GREEN, f"Best RMSE improved to {best_rmse}", tc.ENDC)
@@ -979,7 +1120,7 @@ if __name__ == '__main__':
 			best_model_path = f"results/RUN_{EXP_NAME}_{run_name}_best.pth.tar"
 			save_checkpoint(model, optimizer=optimizer, filename=best_model_path)
 			
-		if results['RMSE'][0] > worst_rmse:
+		if not REVISION_PROTOCOL and results['RMSE'][0] > worst_rmse:
 			worst_rmse = results['RMSE'][0]
 			worst_seed = seed
 			print(tc.BOLD_BAKGROUNDs.RED, f"Worst RMSE worsened to {worst_rmse}", tc.ENDC)
@@ -1032,19 +1173,26 @@ if __name__ == '__main__':
 	cv_results_full['SCMRL_ALPHA_INIT'] = SCMRL_ALPHA_INIT if USE_SCMRL_FUSION else None
 	cv_results_full['SCMRL_LAMBDA_ALIGN'] = SCMRL_LAMBDA_ALIGN if USE_SCMRL_FUSION else None
 	cv_results_full['SCMRL_TEMPERATURE'] = SCMRL_TEMPERATURE if USE_SCMRL_FUSION else None
+	cv_results_full['SCMRL_PARALLEL'] = SCMRL_PARALLEL if USE_SCMRL_FUSION else None
+	cv_results_full['SCMRL_LEGACY'] = SCMRL_LEGACY if USE_SCMRL_FUSION else None
 	cv_results_full['REG_VERSION'] = REG_VERSION
 	cv_results_full['USE_SPATIAL_ATTENTION'] = USE_SPATIAL_ATTENTION
-	cv_results_full['Best Seed'] = best_seed
+	cv_results_full['Best Seed'] = None if REVISION_PROTOCOL else best_seed
 	cv_results_full['SEEDS'] = SEEDS
 	cv_results_full['OC_MAX'] = OC_MAX
 	cv_results_full['USE_SRTM'] = USE_SRTM
 	cv_results_full['TIME'] = {"start": start_string, "finish": finish_string}
 	cv_results_full['cv_results'] = cv_results
+	cv_results_full['REVISION_PROTOCOL'] = REVISION_PROTOCOL
+	cv_results_full['SPLIT_MANIFEST'] = str(Path(args.split_manifest).resolve()) if args.split_manifest else None
+	cv_results_full['TRAIN_ONLY_PREPROCESSING'] = FIT_PREPROCESSING_ON_TRAIN
+	cv_results_full['REVISION_OUTPUT_DIR'] = str(revision_run_dir.resolve()) if revision_run_dir else None
 
 	# 增强功能参数（新增）
 	cv_results_full['USE_ENHANCED_CLIMATE'] = USE_ENHANCED_CLIMATE
 	cv_results_full['USE_CROSS_MODAL_FUSION'] = USE_CROSS_MODAL_FUSION
 	cv_results_full['FUSION_TYPE'] = FUSION_TYPE
+	cv_results_full['REVISION_FUSION'] = REVISION_FUSION
 	cv_results_full['PRETRAINED_MODEL'] = PRETRAINED_MODEL
 	cv_results_full['FREEZE_PRETRAINED'] = FREEZE_PRETRAINED
 	
@@ -1079,6 +1227,15 @@ if __name__ == '__main__':
 
 	with open(f"results/Metrics_{EXP_NAME}_{run_name}.json", "w") as fp:
 		json.dump(to_serializable(cv_results), fp, indent=4)
+
+	if REVISION_PROTOCOL:
+		revision_summary_path = revision_run_dir / 'run_summary.json'
+		with open(revision_summary_path, 'w', encoding='utf-8') as fp:
+			json.dump(to_serializable(cv_results_full), fp, indent=2, ensure_ascii=False)
+		with open(f"results/RUN_{EXP_NAME}_{run_name}.json", "w") as fp:
+			json.dump(to_serializable(cv_results_full), fp, indent=4)
+		print(f"[Revision] Completed without test-set model/seed selection: {revision_summary_path}")
+		raise SystemExit(0)
 		
 	# Load the best model
 	best_model_path = f"results/RUN_{EXP_NAME}_{run_name}_best.pth.tar"

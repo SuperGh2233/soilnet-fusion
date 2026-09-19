@@ -14,6 +14,10 @@ directories into this repository.
 - Fusion checks: `python test_semantic_aligned_fusion.py` and
   `python test_scmrl_integration.py`
 - Spectral encoder check: `python test_spectral_cnn.py`
+- Revision protocol check: `python test_revision_protocol.py`
+- Buffered split: `python prepare_revision_split.py`
+- Revision queue: `python run_revision_experiments.py --matrix core`
+- Result aggregation: `python analyze_revision_results.py --help`
 - Training help: `python train.py --help` and `python train_ssl.py --help`
 - Environment definition: `requirements/pytorch_reqs.yml`
 
@@ -61,8 +65,14 @@ run full training or regenerate datasets as part of a source merge.
 - `docs/index.md`: document map and status registry.
 - `docs/plans/active/PLAN-20260919-unify-soilnet-repositories.md`: active
   two-repository consolidation scope and acceptance criteria.
+- `docs/plans/active/PLAN-20260919-grsl-major-revision-experiments.md`:
+  reviewer-driven experiment protocol, acceptance criteria, and run order.
+- `docs/evals/EVAL-20260919-submitted-split-reanalysis.md`: preliminary
+  unclipped-target and bootstrap reanalysis of the submitted split.
 - To change model behavior or merge remote model code, read the active plan
   first.
+- To run, interpret, or prune code for the GRSL revision, read the revision
+  plan and evaluation report first.
 - To resume interrupted work, read `docs/agent-handoff.md` when present.
 
 ## Session recovery

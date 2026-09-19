@@ -578,7 +578,8 @@ def train(model: torch.nn.Module,
           tail_threshold = 30.0,
           tail_weight = 2.0,
           alignment_loss_fn = None,
-          lambda_align = 0.1
+          lambda_align = 0.1,
+          select_best_on_val = False
           ):
     """ Train the model and test it on the test set
     Note: If you don't have diffrent validation and test sets, just pass the same dataloader for both test and val
@@ -611,8 +612,12 @@ def train(model: torch.nn.Module,
                "R2": [],
                "train_MAE": [],
                 "train_RMSE": [],
-                "train_R2": []
+                "train_R2": [],
+                "best_epoch": None,
+                "best_val_loss": None,
     }
+    best_val_loss = float('inf')
+    best_epoch = None
     
     # 3. Loop through training and testing steps for a number of epochs
     for epoch in range(1, epochs+1):
@@ -639,6 +644,13 @@ def train(model: torch.nn.Module,
             huber_beta=huber_beta,
             tail_threshold=tail_threshold,
             tail_weight=tail_weight)
+
+        if select_best_on_val and val_loss < best_val_loss:
+            if not save_model_path:
+                raise ValueError('select_best_on_val requires save_model_path')
+            best_val_loss = float(val_loss)
+            best_epoch = epoch
+            save_checkpoint(model, optimizer, filename=save_model_path)
         # 验证后恢复训练模式
         model.train()
         
@@ -664,9 +676,16 @@ def train(model: torch.nn.Module,
         if lr_scheduler == "step":
             scheduler.step()
         elif lr_scheduler == "plateau":
-            scheduler.step(train_loss)
+            scheduler.step(val_loss)
         else:
             pass
+    if select_best_on_val:
+        if best_epoch is None:
+            raise RuntimeError('No validation checkpoint was selected')
+        load_checkpoint(model, optimizer, filename=save_model_path)
+        results["best_epoch"] = best_epoch
+        results["best_val_loss"] = best_val_loss
+
     # 计算测试集指标（必须在原尺度上计算）
     if label_mode in ['baseline_raw_mse', 'log1p_mse', 'log1p_huber', 'log1p_huber_w']:
         # label_mode 模式：在原尺度上计算指标
@@ -694,7 +713,7 @@ def train(model: torch.nn.Module,
             results["train_RMSE"].append([test_step(model=model, data_loader=train_dataloader, loss_fn=RMSELoss(), verbose=False)])
             results["train_R2"].append([test_step(model=model, data_loader=train_dataloader, loss_fn=R2Score().to(device), verbose=False)])
     # Save the model
-    if save_model_path:
+    if save_model_path and not select_best_on_val:
         if save_model_if_mae_lower_than:
             if results["MAE"][-1] < save_model_if_mae_lower_than:
                 save_checkpoint(model, optimizer, filename=save_model_path)
@@ -1000,5 +1019,4 @@ def create_adaptive_scheduler(optimizer, epochs, initial_lr, scheduler_type="cos
         scheduler = None
     
     return scheduler
-
 

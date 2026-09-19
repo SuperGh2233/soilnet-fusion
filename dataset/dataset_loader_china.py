@@ -7,6 +7,25 @@ from torchvision import datasets, transforms
 import pandas as pd
 import torch.nn.functional as F
 
+
+def normalize_point_id(value):
+    return str(value).replace('.0', '').strip()
+
+
+def _filter_image_names(l8_dir, point_ids=None):
+    names = sorted(f for f in os.listdir(l8_dir) if f.endswith('.tif'))
+    if point_ids is None:
+        return names
+    allowed = {normalize_point_id(value) for value in point_ids}
+    return [name for name in names if normalize_point_id(name.split('_')[0]) in allowed]
+
+
+def _point_id_column(df):
+    for col in df.columns:
+        if col.lower() in ['point_id', 'pointid', 'pid']:
+            return col
+    raise ValueError('No Point_id column found in climate data')
+
 # 直接定义需要的函数，避免导入问题
 def reshape_tensor(tensor):
     """Takes in a pytorch tensor and reshapes it to (C,H,W) if it is not already in that shape."""
@@ -57,13 +76,12 @@ except ImportError:
     from .dataset_loader import myNormalize, myToTensor, Augmentations, NormalizeClimDF
 
 class ChinaSNDataset(Dataset):
-  def __init__(self, l8_dir, csv_dir , l8_bands: list = None ,transform = None, return_point_id = False):
+  def __init__(self, l8_dir, csv_dir , l8_bands: list = None ,transform = None, return_point_id = False, point_ids=None):
     # Declaring them becuase we nee them in __getitem__ function
     self.l8_dir = l8_dir
     self.csv_dir = csv_dir
     # List of the names in each path
-    self.l8_names = [f for f in os.listdir(l8_dir) if f.endswith('.tif')] # reading only 
-    self.l8_names.sort()
+    self.l8_names = _filter_image_names(l8_dir, point_ids)
     # Declaring the l8 bands we want to use, if None all the bands will be used
     self.l8_bands = l8_bands if l8_bands else None
     # Declaring the transform function
@@ -111,14 +129,14 @@ class ChinaSNDatasetClimate(Dataset):
   def __init__(self, l8_dir, csv_dir , climate_csv_folder,
                l8_bands: list = None ,transform = None,
                dates = None,  # 使用 None，让代码自动从 CSV 文件读取日期
-               climate_dtype = torch.float32, normalize_climate = True, return_point_id = False):
+               climate_dtype = torch.float32, normalize_climate = True, return_point_id = False,
+               point_ids=None, climate_stats=None, fit_climate_stats=False):
     
     # Declaring them becuase we nee them in __getitem__ function
     self.l8_dir = l8_dir
     self.csv_dir = csv_dir
     # List of the names in each path
-    self.l8_names = [f for f in os.listdir(l8_dir) if f.endswith('.tif')] # reading only 
-    self.l8_names.sort()
+    self.l8_names = _filter_image_names(l8_dir, point_ids)
     # Declaring the l8 bands we want to use, if None all the bands will be used
     self.l8_bands = l8_bands if l8_bands else None
     # Declaring the transform function
@@ -128,8 +146,11 @@ class ChinaSNDatasetClimate(Dataset):
     
     # Reading Climate csv files
     # List all files in the directory and filter for .csv files
-    csv_files = [f for f in os.listdir(climate_csv_folder) if os.path.isfile(os.path.join(climate_csv_folder, f)) and f.endswith('.csv')]
-    self.clim_dfs =  [pd.read_csv(os.path.join(climate_csv_folder, f)) for f in csv_files]
+    self.climate_csv_files = sorted(
+        f for f in os.listdir(climate_csv_folder)
+        if os.path.isfile(os.path.join(climate_csv_folder, f)) and f.endswith('.csv')
+    )
+    self.clim_dfs = [pd.read_csv(os.path.join(climate_csv_folder, f)) for f in self.climate_csv_files]
     
     # 自动从第一个气候文件读取日期列
     if dates is None and len(self.clim_dfs) > 0:
@@ -140,13 +161,50 @@ class ChinaSNDatasetClimate(Dataset):
     else:
         self.dates = dates or []
     
+    self.climate_stats = None
     if normalize_climate and self.dates:
-        norm_clim = NormalizeClimDF(dates=self.dates)
-        self.clim_dfs = [norm_clim(clim_df) for clim_df in self.clim_dfs]
+        fit_ids = {
+            normalize_point_id(name.split('_')[0]) for name in self.l8_names
+        }
+        if climate_stats is None:
+            self.climate_stats = {}
+            for name, clim_df in zip(self.climate_csv_files, self.clim_dfs):
+                values = clim_df[self.dates]
+                if fit_climate_stats:
+                    pid_col = _point_id_column(clim_df)
+                    mask = clim_df[pid_col].map(normalize_point_id).isin(fit_ids)
+                    values = clim_df.loc[mask, self.dates]
+                    if values.empty:
+                        raise ValueError(f'No training rows found while fitting climate stats for {name}')
+                array = values.to_numpy(dtype=np.float64)
+                self.climate_stats[name] = {
+                    'min': float(np.nanmin(array)),
+                    'max': float(np.nanmax(array)),
+                }
+        else:
+            self.climate_stats = climate_stats
+
+        normalized_dfs = []
+        for name, clim_df in zip(self.climate_csv_files, self.clim_dfs):
+            if name not in self.climate_stats:
+                raise ValueError(f'Missing climate preprocessing stats for {name}')
+            minimum = float(self.climate_stats[name]['min'])
+            maximum = float(self.climate_stats[name]['max'])
+            scale = maximum - minimum
+            normalized = clim_df.copy()
+            if scale == 0:
+                normalized[self.dates] = 0.0
+            else:
+                normalized[self.dates] = (normalized[self.dates] - minimum) / scale
+            normalized_dfs.append(normalized)
+        self.clim_dfs = normalized_dfs
     
     self.clim_dtype = climate_dtype
     
     self.return_point_id = return_point_id
+
+  def get_climate_stats(self):
+    return self.climate_stats
     
   def __len__(self):
     return len(self.l8_names)
@@ -209,4 +267,4 @@ class ChinaSNDatasetClimate(Dataset):
     if self.return_point_id:
         return (l8_img,clim_arr),socd, point_id
     else:
-        return (l8_img,clim_arr),socd 
+        return (l8_img,clim_arr),socd

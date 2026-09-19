@@ -7,7 +7,12 @@
 
 ## Active requirements and plans
 
-- `docs/plans/active/PLAN-20260919-unify-soilnet-repositories.md` (active): merge local model experiments with the remote SoilNet model code while keeping the system application in its own repository.
+- `docs/plans/active/PLAN-20260919-grsl-major-revision-experiments.md` (active): reviewer-to-experiment matrix, corrected evaluation protocol, and execution order for the GRSL major revision.
+- `docs/plans/active/PLAN-20260919-unify-soilnet-repositories.md` (completed): merge local model experiments with the remote SoilNet model code while keeping the system application in its own repository.
+
+## Evaluations
+
+- `docs/evals/EVAL-20260919-submitted-split-reanalysis.md` (active): preliminary unclipped-target and paired-bootstrap analysis of the submitted A4/A6 predictions; replace with corrected spatial-protocol results when complete.
 
 ## Architecture and specifications
 

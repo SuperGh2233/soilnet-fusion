@@ -35,6 +35,7 @@ dataset/l8_images_us/
 dataset/l8_images_simclr_RaCA/
 dataset/l8_images_*/
 dataset/*.zip
+revision_outputs/
 
 # 结果和分析文件
 *.csv

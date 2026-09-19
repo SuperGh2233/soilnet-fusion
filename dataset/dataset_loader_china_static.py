@@ -10,7 +10,6 @@ from skimage import io
 import os
 import pandas as pd
 import torch.nn.functional as F
-from sklearn.preprocessing import StandardScaler
 
 # 导入基础类和函数
 try:
@@ -29,7 +28,9 @@ class ChinaSNDatasetClimateStatic(ChinaSNDatasetClimate):
                  static_csv_path=None,  # 静态特征CSV路径
                  l8_bands=None, transform=None,
                  dates=None, climate_dtype=torch.float32, 
-                 normalize_climate=True, return_point_id=False):
+                 normalize_climate=True, return_point_id=False,
+                 point_ids=None, climate_stats=None, fit_climate_stats=False,
+                 static_stats=None, fit_static_stats=False):
         """
         Args:
             static_csv_path: 预处理后的静态特征CSV路径（包含归一化后的特征）
@@ -39,11 +40,15 @@ class ChinaSNDatasetClimateStatic(ChinaSNDatasetClimate):
                         l8_bands=l8_bands, transform=transform,
                         dates=dates, climate_dtype=climate_dtype,
                         normalize_climate=normalize_climate, 
-                        return_point_id=return_point_id)
+                        return_point_id=return_point_id,
+                        point_ids=point_ids,
+                        climate_stats=climate_stats,
+                        fit_climate_stats=fit_climate_stats)
         
         # 加载静态特征
         self.static_features = None
         self.static_feature_cols = None
+        self.static_stats = None
         
         if static_csv_path and os.path.exists(static_csv_path):
             print(f"加载静态特征: {static_csv_path}")
@@ -67,8 +72,7 @@ class ChinaSNDatasetClimateStatic(ChinaSNDatasetClimate):
             if len(self.static_feature_cols) == 0:
                 raise ValueError(f"静态特征CSV中未找到特征列: {static_csv_path}")
             
-            # 将非数值型（如LULC/CLCD）保留为“索引”以供Embedding；数值列做均值填充
-            self.static_category_maps = {}
+            # 将非数值型（如LULC/CLCD）保留为“索引”以供Embedding。
             feats_df_raw = static_df[self.static_feature_cols].copy()
             categorical_cols = []
             numeric_cols = []
@@ -83,60 +87,70 @@ class ChinaSNDatasetClimateStatic(ChinaSNDatasetClimate):
             if len(categorical_cols) > 0:
                 self.lulc_col = categorical_cols[0]
             
-            # 数值列：转换为数值并缺失填充为均值
-            feats_num = pd.DataFrame(index=feats_df_raw.index)
-            if len(numeric_cols) > 0:
+            pid_values = static_df[pid_col].map(lambda value: str(value).replace('.0', '').strip())
+            training_ids = {
+                str(name).split('_')[0].replace('.0', '').strip()
+                for name in self.l8_names
+            }
+            fit_mask = pid_values.isin(training_ids) if fit_static_stats else pd.Series(True, index=static_df.index)
+            if fit_static_stats and not fit_mask.any():
+                raise ValueError('No training rows found while fitting static preprocessing stats')
+
+            if static_stats is None:
                 feats_num = feats_df_raw[numeric_cols].apply(pd.to_numeric, errors='coerce')
-                for col in numeric_cols:
-                    if feats_num[col].isna().any():
-                        feats_num[col] = feats_num[col].fillna(feats_num[col].mean())
+                fit_numeric = feats_num.loc[fit_mask]
+                means = fit_numeric.mean()
+                fit_filled = fit_numeric.fillna(means)
+                scales = fit_filled.std(ddof=0).replace(0, 1.0).fillna(1.0)
+                categories = []
+                if self.lulc_col is not None:
+                    categories = list(dict.fromkeys(
+                        feats_df_raw.loc[fit_mask, self.lulc_col]
+                        .dropna().astype(str).str.strip().tolist()
+                    ))
+                self.static_stats = {
+                    'numeric_cols': list(numeric_cols),
+                    'mean': {col: float(means[col]) for col in numeric_cols},
+                    'scale': {col: float(scales[col]) for col in numeric_cols},
+                    'lulc_col': self.lulc_col,
+                    'lulc_categories': categories,
+                }
+            else:
+                self.static_stats = static_stats
+                numeric_cols = list(self.static_stats.get('numeric_cols', []))
+                self.lulc_col = self.static_stats.get('lulc_col')
 
-            # 保存数值列次序，用于模型输入维度
-            self.static_numeric_cols = list(feats_num.columns)
+            self.static_numeric_cols = list(numeric_cols)
+            feats_num = feats_df_raw[self.static_numeric_cols].apply(pd.to_numeric, errors='coerce')
+            means = pd.Series(self.static_stats.get('mean', {}), dtype=float)
+            scales = pd.Series(self.static_stats.get('scale', {}), dtype=float).replace(0, 1.0)
+            feats_num = feats_num.fillna(means)
+            numeric_values_normalized = (
+                (feats_num - means) / scales
+            ).to_numpy(dtype=np.float32) if self.static_numeric_cols else np.zeros((len(static_df), 0), dtype=np.float32)
 
-            # 类别列：保存索引映射（用于Embedding），仅对选定的lulc_col生效
-            self.lulc_index_map = {}
-            self.num_lulc_classes = 0
+            categories = [str(value) for value in self.static_stats.get('lulc_categories', [])]
+            self.lulc_index_map = {value: index for index, value in enumerate(categories)}
+            self.num_lulc_classes = len(categories)
             if self.lulc_col is not None:
-                series = feats_df_raw[self.lulc_col].astype(str).str.strip()
-                codes, uniques = pd.factorize(series)
-                self.lulc_index_map = {str(v): int(i) for i, v in enumerate(uniques)}
-                self.num_lulc_classes = len(uniques)
-                lulc_codes = codes.astype(np.int64)
+                lulc_codes = (
+                    feats_df_raw[self.lulc_col].astype(str).str.strip()
+                    .map(self.lulc_index_map).fillna(-1).astype(np.int64).to_numpy()
+                )
             else:
-                # 如果没有类别列，使用-1占位
-                lulc_codes = np.full((feats_df_raw.shape[0],), -1, dtype=np.int64)
+                lulc_codes = np.full((len(static_df),), -1, dtype=np.int64)
 
-            # 归一化数值特征（关键修复：神经网络需要归一化的特征）
-            self.static_scaler = None
-            numeric_values = feats_num[self.static_numeric_cols].values.astype(np.float32) if len(self.static_numeric_cols) > 0 else np.zeros((feats_df_raw.shape[0], 0), dtype=np.float32)
-            
-            if len(self.static_numeric_cols) > 0 and numeric_values.shape[0] > 0:
-                # 使用StandardScaler进行标准化（均值0，方差1）
-                # 这与气候特征的归一化方式保持一致
-                self.static_scaler = StandardScaler()
-                numeric_values_normalized = self.static_scaler.fit_transform(numeric_values)
-                print(f"  ✓ 已对静态数值特征进行标准化（StandardScaler）")
-                
-                # 格式化统计信息（处理数组格式化问题）
-                n_show = min(3, len(self.static_numeric_cols))
-                mean_before = numeric_values.mean(axis=0)[:n_show]
-                std_before = numeric_values.std(axis=0)[:n_show]
-                mean_after = numeric_values_normalized.mean(axis=0)[:n_show]
-                std_after = numeric_values_normalized.std(axis=0)[:n_show]
-                
-                print(f"    归一化前统计: mean={mean_before}, std={std_before}")
-                print(f"    归一化后统计: mean={mean_after}, std={std_after}")
-            else:
-                numeric_values_normalized = numeric_values
+            if self.static_numeric_cols:
+                scope = 'training subset' if fit_static_stats or static_stats is not None else 'complete CSV (legacy mode)'
+                print(f"  [OK] 已使用 {scope} 的统计量标准化静态数值特征")
             
             # 构建查找表
             self.static_numeric_features = {}
             self.lulc_indices = {}
-            for idx, row in static_df.iterrows():
+            for position, (_, row) in enumerate(static_df.iterrows()):
                 point_id = str(row[pid_col]).replace('.0', '').strip()
-                self.static_numeric_features[point_id] = numeric_values_normalized[idx]
-                self.lulc_indices[point_id] = int(lulc_codes[idx])
+                self.static_numeric_features[point_id] = numeric_values_normalized[position]
+                self.lulc_indices[point_id] = int(lulc_codes[position])
             
             print(f"  静态数值特征维度: {len(self.static_numeric_cols)}")
             if self.lulc_col is not None:
@@ -217,3 +231,5 @@ class ChinaSNDatasetClimateStatic(ChinaSNDatasetClimate):
         """返回LULC类别数（若无类别列则为0）"""
         return int(getattr(self, 'num_lulc_classes', 0))
 
+    def get_static_stats(self):
+        return self.static_stats

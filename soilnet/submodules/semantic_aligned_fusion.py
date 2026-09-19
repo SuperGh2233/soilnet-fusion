@@ -654,6 +654,79 @@ class SemanticAlignedFusionParallel(nn.Module):
         return alphas
 
 
+class GatedFeatureFusion(nn.Module):
+    """Competitive pooled-feature gated fusion baseline."""
+
+    def __init__(self, climate_dim, visual_dim, static_dim=None, dropout=0.1):
+        super().__init__()
+        self.visual_proj = nn.Linear(visual_dim, climate_dim)
+        self.visual_gate = nn.Sequential(
+            nn.Linear(climate_dim * 2, climate_dim), nn.Sigmoid()
+        )
+        self.static_proj = nn.Linear(static_dim, climate_dim) if static_dim is not None else None
+        self.static_gate = (
+            nn.Sequential(nn.Linear(climate_dim * 2, climate_dim), nn.Sigmoid())
+            if static_dim is not None else None
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(climate_dim)
+
+    def forward(self, climate_feat, visual_feat, static_feat=None):
+        if visual_feat.dim() == 3:
+            visual_feat = visual_feat.mean(dim=1)
+        visual = self.visual_proj(visual_feat)
+        gate = self.visual_gate(torch.cat([climate_feat, visual], dim=-1))
+        fused = gate * climate_feat + (1.0 - gate) * self.dropout(visual)
+        if static_feat is not None and self.static_proj is not None:
+            if static_feat.dim() == 3:
+                static_feat = static_feat.mean(dim=1)
+            static = self.static_proj(static_feat)
+            static_gate = self.static_gate(torch.cat([fused, static], dim=-1))
+            fused = static_gate * fused + (1.0 - static_gate) * self.dropout(static)
+        return self.norm(fused)
+
+
+class TokenCrossAttentionFusion(nn.Module):
+    """Token-level cross-attention baseline without a learnable residual scale."""
+
+    def __init__(self, climate_dim, visual_dim, static_dim=None, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.visual_proj = nn.Linear(visual_dim, climate_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            climate_dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.visual_fusion = nn.Sequential(
+            nn.Linear(climate_dim * 2, climate_dim),
+            nn.LayerNorm(climate_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.static_proj = nn.Linear(static_dim, climate_dim) if static_dim is not None else None
+        self.static_fusion = (
+            nn.Sequential(
+                nn.Linear(climate_dim * 2, climate_dim),
+                nn.LayerNorm(climate_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ) if static_dim is not None else None
+        )
+
+    def forward(self, climate_feat, visual_feat, static_feat=None):
+        query = climate_feat.unsqueeze(1) if climate_feat.dim() == 2 else climate_feat
+        tokens = visual_feat.unsqueeze(1) if visual_feat.dim() == 2 else visual_feat
+        tokens = self.visual_proj(tokens)
+        attended, _ = self.cross_attention(query, tokens, tokens, need_weights=False)
+        climate_vector = query.mean(dim=1)
+        attended_vector = attended.mean(dim=1)
+        fused = self.visual_fusion(torch.cat([climate_vector, attended_vector], dim=-1))
+        if static_feat is not None and self.static_proj is not None:
+            if static_feat.dim() == 3:
+                static_feat = static_feat.mean(dim=1)
+            static = self.static_proj(static_feat)
+            fused = self.static_fusion(torch.cat([fused, static], dim=-1))
+        return fused
+
+
 class FiLMFusion(nn.Module):
     """
     FiLM (Feature-wise Linear Modulation) 融合模块
